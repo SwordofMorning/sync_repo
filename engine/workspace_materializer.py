@@ -513,12 +513,13 @@ class WorkspaceMaterializer:
     def _run_windows_worker(
         self, manifest: dict, lease: dict, lease_callback: Optional[Callable[[dict], None]],
     ) -> dict:
-        manifest_path = os.path.join(self.staging_dir, f"worker_{lease['intent_nonce']}.json")
+        manifest_path = os.path.join(self.staging_dir, f"worker_{lease['intent_nonce']}.old")
         result_path = manifest_path + ".result"
         _write_json_atomic(manifest_path, manifest)
         powershell = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
                                   "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-        command = [powershell, "-NoProfile", "-NonInteractive", "-File", self.worker_script_path,
+        command = [powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                   "-File", self.worker_script_path,
                    "-ManifestPath", manifest_path, "-ResultPath", result_path,
                    "-ParentPid", str(lease["parent_pid"]),
                    "-ParentCreateTimeFt", str(lease["parent_create_time_ft"]),

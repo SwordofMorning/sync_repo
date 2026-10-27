@@ -388,6 +388,7 @@ class ExcludeEngine:
         entries = ls_fn(tree_oid)
         shared_norm: Dict[str, Tuple[str, str]] = {}
 
+        allowed_entries = []
         for entry in entries:
             path = entry["path"]
             mode = entry["mode"]
@@ -400,8 +401,21 @@ class ExcludeEngine:
             )
             if decision != ExcludeDecision.ALLOW or is_tree:
                 continue
+            allowed_entries.append((path, mode, oid))
 
-            raw_bytes = git_adapter.cat_file_blob(oid)
+        batch_fn = getattr(git_adapter, "cat_file_blobs_batch", None)
+        blob_map = (
+            batch_fn([oid for _, _, oid in allowed_entries])
+            if callable(batch_fn)
+            else {}
+        )
+
+        for path, mode, oid in allowed_entries:
+            raw_bytes = (
+                blob_map[oid]
+                if oid in blob_map
+                else git_adapter.cat_file_blob(oid)
+            )
             plain_bytes = decrypt_fn(raw_bytes) if decrypt_fn is not None else raw_bytes
             chash = norm.canon_hash(path, plain_bytes)
             shared_norm[path] = (mode, chash)
@@ -426,6 +440,7 @@ class ExcludeEngine:
         ls_fn = getattr(git_adapter, "ls_tree_r_z_strict", git_adapter.ls_tree_r_z)
         entries = ls_fn(tree_oid)
 
+        scan_candidates = []
         for entry in entries:
             path = entry["path"]
             mode = entry["mode"]
@@ -461,17 +476,30 @@ class ExcludeEngine:
                 )
 
             if not is_tree and self.is_path_in_content_scan_scope(path):
-                raw_bytes = git_adapter.cat_file_blob(oid)
-                plain_bytes = (
-                    decrypt_fn(raw_bytes) if decrypt_fn is not None else raw_bytes
+                scan_candidates.append((path, oid))
+
+        batch_fn = getattr(git_adapter, "cat_file_blobs_batch", None)
+        scan_blobs = (
+            batch_fn([oid for _, oid in scan_candidates])
+            if callable(batch_fn) and scan_candidates
+            else {}
+        )
+        for path, oid in scan_candidates:
+            raw_bytes = (
+                scan_blobs[oid]
+                if oid in scan_blobs
+                else git_adapter.cat_file_blob(oid)
+            )
+            plain_bytes = (
+                decrypt_fn(raw_bytes) if decrypt_fn is not None else raw_bytes
+            )
+            passed, rule_name, hint = self.scan_content_blob(path, plain_bytes)
+            if not passed:
+                return (
+                    False,
+                    f"Export tree {tree_oid} failed content scan at '{path}' "
+                    f"(rule={rule_name}): {hint}",
                 )
-                passed, rule_name, hint = self.scan_content_blob(path, plain_bytes)
-                if not passed:
-                    return (
-                        False,
-                        f"Export tree {tree_oid} failed content scan at '{path}' "
-                        f"(rule={rule_name}): {hint}",
-                    )
 
         return True, "EXPORT_TREE_VALID"
 

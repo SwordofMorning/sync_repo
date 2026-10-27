@@ -53,6 +53,7 @@ class ProjectorGitFixture(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         git = GitAdapter(path)
+        git._run_checked(["config", "core.protectNTFS", "false"])
         git._run_checked(["symbolic-ref", "HEAD", "refs/heads/main"])
         with open(os.path.join(path, "untracked-sentinel"), "wb") as handle:
             handle.write(b"do not touch\n")

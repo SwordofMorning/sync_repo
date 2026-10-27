@@ -169,6 +169,34 @@ class GitAdapter:
     def cat_file_blob(self, blob_oid: str, env: Optional[dict] = None) -> bytes:
         return self._run_checked(["cat-file", "-p", blob_oid], env=env)
 
+    def cat_file_blobs_batch(
+        self, blob_oids: List[str], env: Optional[dict] = None
+    ) -> Dict[str, bytes]:
+        unique_oids = list(dict.fromkeys(oid for oid in blob_oids if oid))
+        if not unique_oids:
+            return {}
+        stdin_data = ("\n".join(unique_oids) + "\n").encode("ascii")
+        stdout = self._run_checked(["cat-file", "--batch"], stdin_bytes=stdin_data, env=env)
+        result: Dict[str, bytes] = {}
+        pos = 0
+        total = len(stdout)
+        while pos < total:
+            nl = stdout.find(b"\n", pos)
+            if nl == -1:
+                raise GitError("Malformed cat-file --batch header")
+            header = stdout[pos:nl].decode("ascii", errors="replace").split()
+            if len(header) < 3 or header[1] == "missing":
+                raise GitError(f"Object missing or invalid in cat-file --batch: {header}")
+            oid_str = header[0]
+            size = int(header[2])
+            data_start = nl + 1
+            data_end = data_start + size
+            if data_end > total:
+                raise GitError(f"Truncated cat-file --batch payload for {oid_str}")
+            result[oid_str] = stdout[data_start:data_end]
+            pos = data_end + 1
+        return result
+
     def has_object(self, oid: str, env: Optional[dict] = None) -> bool:
         _, _, code = self._run(["cat-file", "-e", oid], env=env)
         return code == 0

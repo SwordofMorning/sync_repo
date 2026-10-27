@@ -430,9 +430,9 @@ class TestLedgerAndConfiguration(GitFixture):
         with open(os.path.join(root, "configs", "sync_config.json"), "w") as stream:
             json.dump(config, stream)
         repo = SyncConfig(root).get_repo("sample")
-        self.assertTrue(repo["state_file"].endswith(".sync_state/state_smart.json"))
+        self.assertTrue(repo["state_file"].replace("\\", "/").endswith(".sync_state/state_smart.json"))
         self.assertEqual(repo["legacy_state_file"], repo["state_file"])
-        self.assertTrue(repo["state_file_v23"].endswith(".sync_state/state_sample_v23.json"))
+        self.assertTrue(repo["state_file_v23"].replace("\\", "/").endswith(".sync_state/state_sample_v23.json"))
         binding = compute_endpoint_binding(self.git_a, self.git_b, repo)
         digest = compute_epoch_digest(repo, binding)
         self.assertEqual(digest, compute_epoch_digest(dict(reversed(list(repo.items()))), dict(reversed(list(binding.items())))))

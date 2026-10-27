@@ -6,6 +6,7 @@ import copy
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 from typing import Optional
@@ -28,6 +29,11 @@ from engine.tree_projector import TreeProjector, TreeProjectionError
 from engine.workspace_materializer import WorkspaceMaterializer, MaterializeError
 
 
+def _safe_rmtree(path: str) -> None:
+    if os.path.exists(path):
+        shutil.rmtree(path, onerror=lambda func, p, _exc: (os.chmod(p, stat.S_IWRITE), func(p)))
+
+
 class _ObjectView:
     """Read a simulated target's objects; never change source/process environment."""
     def __init__(self, git, env=None):
@@ -41,6 +47,9 @@ class _ObjectView:
 
     def cat_file_blob(self, oid):
         return self.git.cat_file_blob(oid, env=self.env)
+
+    def cat_file_blobs_batch(self, oids):
+        return self.git.cat_file_blobs_batch(oids, env=self.env)
 
 
 class SyncApp:
@@ -234,7 +243,7 @@ class SyncApp:
             print(f"[DRY-RUN] {plan['state']}: {len(plan['commits'])} commits; candidate={candidate}; tree={tree}")
             return plan
         finally:
-            shutil.rmtree(scratch)
+            _safe_rmtree(scratch)
 
     def _forward_repair(self, tx, materializer, verifier, tx_mgr):
         old_tree, new_tree = tx["pre_tx_tree_target"], tx["final_tree_oid"]
@@ -256,7 +265,7 @@ class SyncApp:
                     old_tree, new_tree, staging_info=info, lease_callback=save_lease)
                 tx["executor_lease"] = None
                 tx_mgr._save_state()
-                shutil.rmtree(materializer.staging_dir)
+                _safe_rmtree(materializer.staging_dir)
             else:
                 materializer.materialize_delta(old_tree, new_tree)
         self._gate(verifier.verify_transaction_delta_gates(tx["direction"], old_tree, new_tree),
@@ -275,7 +284,7 @@ class SyncApp:
             bridge.staging_dir = os.path.join(bridge_scratch, "decrypt")
             return self._sync_live_repo(repo, git_a, git_b, bridge, requested_direction, no_fetch)
         finally:
-            shutil.rmtree(bridge_scratch)
+            _safe_rmtree(bridge_scratch)
 
     def _sync_live_repo(self, repo, git_a, git_b, bridge, requested_direction, no_fetch):
         binding = compute_endpoint_binding(git_a, git_b, repo)
@@ -391,7 +400,7 @@ class SyncApp:
             print(f"[+] {repo['repo_id']}: {direction} {result}; candidate={candidate}")
             return plan
         finally:
-            shutil.rmtree(scratch)
+            _safe_rmtree(scratch)
 
     def _isolated_rehearsal(self, repo, sandbox_dir, requested_direction, no_fetch):
         sandbox = os.path.abspath(sandbox_dir)

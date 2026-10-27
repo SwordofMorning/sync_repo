@@ -4,7 +4,7 @@ import base64
 import hashlib
 import os
 import secrets
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from engine.content_normalizer import ContentNormalizer, normalize_lf_idempotent
 from engine.git_adapter import GitAdapter
@@ -138,13 +138,43 @@ class DlpVerifier:
         return any(path.lower().endswith(ext.lower() if ext.startswith(".") else "." + ext.lower())
                    for ext in extensions)
 
+    def _physical_batch(self, paths: List[str], root: Optional[str] = None) -> Dict[str, bytes]:
+        if not paths:
+            return {}
+        if self.physical_reader is not None or os.name != "nt":
+            return {p: self._physical(p, root=root) for p in paths}
+        root = root or self.target_worktree
+        worker = WorkspaceMaterializer(self.target_git, root,
+                                       tx_id="probe_" + secrets.token_hex(12))
+        manifest = {"tx_id": worker.tx_id, "nonce": secrets.token_hex(16), "items": [
+            {"mode": "PROBE_PHYSICAL_HEADER", "target_abs_path": p, "include_bytes": True}
+            for p in paths
+        ]}
+        out: Dict[str, bytes] = {}
+        try:
+            result = worker._execute_manifest(manifest)
+            for p, item in zip(paths, result["items"]):
+                observed = base64.b64decode(item["physical_bytes_base64"], validate=True)
+                if (item["physical_size"] != len(observed)
+                        or item["physical_sha256"] != hashlib.sha256(observed).hexdigest()
+                        or item["physical_header_hex"] != observed[:16].hex()
+                        or item["has_tsd_header"] != observed.startswith(TSD_MAGIC_HEADER)):
+                    raise ValueError("Physical observer returned inconsistent attestation")
+                out[p] = observed
+            return out
+        finally:
+            if os.path.isdir(worker.staging_dir):
+                import shutil
+                shutil.rmtree(worker.staging_dir)
+
     def _audit_written(
         self, path: str, oid: str, mode: str, role: str,
         extensions: Optional[List[str]],
+        physical_cache: Optional[Dict[str, bytes]] = None,
     ) -> dict:
         expected = self._logical_bytes(path, oid, mode)
         target = self._path(self.target_worktree, path)
-        physical = self._physical(target)
+        physical = physical_cache[target] if (physical_cache and target in physical_cache) else self._physical(target)
         has_header = physical.startswith(TSD_MAGIC_HEADER)
         digest = hashlib.sha256(physical).hexdigest()
         if role == "A":
@@ -166,7 +196,14 @@ class DlpVerifier:
         if not observer_healthy:
             return GateStatus.UNKNOWN, "PHYSICAL_OBSERVER_UNHEALTHY", report
         try:
-            for entry in self.target_git.diff_tree_raw(old_tree_oid, new_tree_oid):
+            deltas = self.target_git.diff_tree_raw(old_tree_oid, new_tree_oid)
+            written_targets = [
+                self._path(self.target_worktree, e["path"])
+                for e in deltas if e["status"] in ("A", "M", "T")
+                and os.path.isfile(self._path(self.target_worktree, e["path"]))
+            ]
+            phys_cache = self._physical_batch(written_targets) if written_targets else {}
+            for entry in deltas:
                 path, status = entry["path"], entry["status"]
                 target = self._path(self.target_worktree, path)
                 if status == "D":
@@ -178,6 +215,7 @@ class DlpVerifier:
                     report["items"].append(self._audit_written(
                         path, entry["new_oid"], entry["new_mode"],
                         "A" if direction == "B2A" else "B", encryption_extensions,
+                        physical_cache=phys_cache,
                     ))
                     report["written"] += 1
                 else:
@@ -203,9 +241,17 @@ class DlpVerifier:
         if not observer_healthy:
             return GateStatus.UNKNOWN, "PHYSICAL_OBSERVER_UNHEALTHY", report
         try:
-            for entry in self.target_git.ls_tree_r_z_strict(tree_oid):
+            entries = self.target_git.ls_tree_r_z_strict(tree_oid)
+            all_targets = [
+                self._path(self.target_worktree, e["path"])
+                for e in entries
+                if os.path.isfile(self._path(self.target_worktree, e["path"]))
+            ]
+            phys_cache = self._physical_batch(all_targets) if all_targets else {}
+            for entry in entries:
                 report["items"].append(self._audit_written(
-                    entry["path"], entry["oid"], entry["mode"], role, encryption_extensions
+                    entry["path"], entry["oid"], entry["mode"], role, encryption_extensions,
+                    physical_cache=phys_cache,
                 ))
                 report["checked"] += 1
         except _LogicalFailure as exc:

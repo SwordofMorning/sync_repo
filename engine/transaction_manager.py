@@ -183,7 +183,7 @@ class TransactionManager:
         with open(v22_path, "rb") as stream:
             original = stream.read()
         backup_path = v22_path + ".v22.bak"
-        if original == LEGACY_SENTINEL.encode("utf-8"):
+        if original.replace(b"\r\n", b"\n") == LEGACY_SENTINEL.encode("utf-8"):
             if not os.path.isfile(backup_path):
                 raise StateLedgerCorruptedError("Migration sentinel has no durable v2.2 backup")
             with open(backup_path, "rb") as stream:

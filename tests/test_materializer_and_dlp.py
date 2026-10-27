@@ -609,7 +609,7 @@ class TestLogicalAndPhysicalGates(GitFixture):
 
     def test_at10_physical_verifier_never_accepts_missing_tsd_header(self):
         tree = self.baseline(self.b, {"a.c": b"source plaintext"})
-        verifier = DlpVerifier(self.b, self.b.repo_dir)
+        verifier = DlpVerifier(self.b, self.b.repo_dir, physical_reader=self.read)
         passed, reason = verifier.verify_physical_dlp_headers(sample_limit=0)
         self.assertFalse(passed)
         self.assertIn("missing/invalid", reason)
