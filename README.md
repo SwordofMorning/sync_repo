@@ -27,51 +27,67 @@ _Workspace_/sync_repo/
 │   ├── sync_config.json              # 多仓库全局配置与实例配置表
 │   ├── manifest_smart.json           # smart 仓库交付白名单清单
 │   └── exclude_rules.json            # Exclude 三态排查规则与构建依赖例外
-├── engine/                           # 核心同步引擎模块
+├── engine/                           # 核心同步引擎模块（v2.3.0 双向同步）
 │   ├── __init__.py
-│   ├── config_loader.py              # 配置加载、路径解析与策略摘要生成
-│   ├── git_adapter.py                # 底层 Git Plumbing 命令适配器
-│   ├── exclude_engine.py             # 三态排查引擎（PRUNE/BLOCK_REVIEW/ALLOW）与内容扫描
-│   ├── dag_builder.py                # 拓扑排序计算与外部父边界闭包强校验
-│   ├── tree_projector.py             # 对象层流式 Blob 传输与自底向上递归 Tree 构建
-│   ├── metadata_sanitizer.py         # 开发者身份强映射与提交正文结构化清洗
-│   ├── workspace_materializer.py     # 可信 Blob 差分物化、删除优先与 DLP 原地覆写
-│   ├── dlp_verifier.py               # 逻辑哈希相等性与物理加密特征双重门禁
-│   └── transaction_manager.py        # 预写式事务状态机（WAL）、两级三态恢复与候选引用隔离
-├── scripts/                          # 自动化调度与客户端配置脚本
+│   ├── config_loader.py              # 配置加载、v2.3 状态路径解析与端点/策略 Epoch 摘要生成
+│   ├── git_adapter.py                # 底层 Git Plumbing 严格退出码与三态祖先检查适配器
+│   ├── path_validator.py             # 跨平台路径合法性、Windows 保留名与大小写折叠前缀树（CaseFoldedNamespaceTrie）
+│   ├── content_normalizer.py         # 分类型幂等内容规范化算子（CanonHash 与 CRLF/LF 归一化）
+│   ├── exclude_engine.py             # 统一自根向叶三态排查引擎（EffectiveDecision）、SharedNorm 与导出树合规验证
+│   ├── process_lock.py               # OS 内核级非阻塞排他文件锁与高熵事务 ID 生成器
+│   ├── dag_builder.py                # 双向状态判定矩阵（S0-S4）、拓扑排序与线性边界强校验
+│   ├── tree_projector.py             # 正向（A -> B）策略记忆化全树递归投影与敏感扫描阻断
+│   ├── reverse_tree_projector.py     # 反向（B -> A）受限差分叠加与完整私有补集（P_priv/A_priv）保护
+│   ├── metadata_sanitizer.py         # 开发者身份双向精确白名单幂等映射与提交正文结构化清洗
+│   ├── workspace_materializer.py     # 正向二次原地写加密、反向隔离暂存区 .old 解密与结构化回滚日志
+│   ├── dlp_verifier.py               # 运行前四步 Canary 探针、全仓物理基线审计与 100% 增量双重门禁
+│   └── transaction_manager.py        # 双向预写式事务账本（WAL v2.3）、五态远端探测恢复与 v2.2 迁移隔离
+├── scripts/                          # 自动化调度、外部非受控文件执行器与客户端配置脚本
+│   ├── file_ops_worker.ps1           # 结构化 JSON 清单驱动的 .NET 文件替换与父进程句柄看门狗执行器
 │   ├── sync_runner.ps1               # Windows PowerShell 服务运行器（Batch/Daemon 模式）
 │   ├── register_task.ps1             # Windows 计划任务注册脚本
 │   ├── sync_runner.sh                # Linux Bash 运行器（支持 Cron/Daemon 调度）
 │   └── setup_dev_client.sh           # 子公司研发终端配置脚本（URL 伪装与 SSH 别名）
-├── tests/                            # 自动化单元测试套件
-│   ├── test_exclude_engine.py        # Exclude 规则、构建依赖例外与内容扫描测试
-│   ├── test_metadata_sanitizer.py    # 身份脱敏与提交正文规范化测试
-│   └── test_dag_builder.py           # 父边界闭包与拓扑排序测试
+├── tests/                            # 自动化单元与端到端故障注入测试套件（149 项自包含测试）
+│   ├── test_git_adapter.py           # Git Plumbing 严格退出码、三态祖先与隔离环境测试
+│   ├── test_exclude_engine.py        # 统一 EffectiveDecision、依赖例外、内容扫描与导出树校验测试
+│   ├── test_path_and_content.py      # 大小写折叠前缀树、Windows 路径边界与幂等内容规范化测试
+│   ├── test_tree_projectors.py       # 正反向树投影、20 个私有子工程保护与历史子树防泄漏测试
+│   ├── test_metadata_sanitizer.py    # 身份精确白名单幂等与提交正文规范化测试
+│   ├── test_dag_builder.py           # 双向 S0-S4 状态矩阵、OS 进程锁与线性拓扑边界测试
+│   ├── test_materializer_and_dlp.py  # .old 隔离解密、Canary 探针、物理门禁与工作区回滚测试
+│   └── test_transaction_and_sync_tool.py # WAL v2.3 迁移、五态远端恢复、零副作用 Dry-Run 与端到端往返测试
 ├── sync_tool.py                      # 统一命令行交互入口
 └── README.md                         # 本工程说明文档
 ```
 
 ## 三、快速开始与 CLI 命令指南
 
-引擎主入口为 `sync_tool.py`，支持同步演练、正式发布、哈希双向查询及运行状态检查：
+引擎主入口为 `sync_tool.py`，支持双向自动/显式方向同步、零副作用只读演练、独立沙箱排练、哈希双向查询及运行状态检查：
 
 ### 3.1 运行同步命令
 
-1. 仿真演练模式（Dry-Run，推荐首次运行或变更规则时使用）：
+1. 零副作用只读演练模式（Dry-Run，推荐首次运行或变更规则时使用）：
    ```bash
-   python sync_tool.py sync --dry-run
+   python sync_tool.py sync --dry-run [--direction {auto,a2b,b2a}]
    ```
-   该模式将在独立对象库中流式重演全部 56 个提交，完成树重构、敏感排查、差分物化与双重门禁核验，但**绝不向远程仓库推送**。
+   该模式在顶层直接分流，使用独立临时对象目录（`GIT_OBJECT_DIRECTORY`）完成正/反向树投影、敏感排查、完整私有补集不变量与 `SharedNorm` 校验，**对生产状态账本、Git 引用、索引和工作区保持 100% 零写入**。
 
-2. 正式增量发布模式（Live Production）：
+2. 独立沙箱全流程排练模式（Isolated Rehearsal）：
    ```bash
-   python sync_tool.py sync
+   python sync_tool.py sync --isolated-rehearsal <sandbox_dir> [--direction {auto,a2b,b2a}]
    ```
-   自动获取 OS 互斥文件锁，重演候选提交序列，通过门禁后执行原子快进推送至 Repo B 远程 `main` 分支，推进本地指针并生成审计报告。
+   将双端仓库与状态复制并重绑定至独立沙箱目录执行完整工作区物化与发布排练，绝不触碰生产工作区或终止生产进程。
 
-3. 指定单一仓库同步：
+3. 正式双向增量发布模式（Live Production）：
    ```bash
-   python sync_tool.py sync --repo smart
+   python sync_tool.py sync [--direction {auto,a2b,b2a}] [--no-fetch]
+   ```
+   自动获取 OS 内核排他文件锁，恢复未决事务，拉取远端权威跟踪引用并按 Phase 1 状态矩阵自动执行 `A -> B`（二次原地写触发 `%TSD-Header-###%` 加密）或 `B -> A`（通过 `.git/sync_staging/<tx_id>/` 下的 `.old` 通道解密并保持 Repo A 纯明文与 20 个私有子工程不变），通过双重门禁后执行带 `--force-with-lease` 的原子快进推送，同步更新本地引用、`.git/index` 与双端水位线。
+
+4. 指定单一仓库同步：
+   ```bash
+   python sync_tool.py sync --repo smart [--direction {auto,a2b,b2a}]
    ```
 
 ### 3.2 提交哈希双向查询工具（防穿帮神器）
@@ -104,9 +120,9 @@ python sync_tool.py status
 ### 3.4 运行单元测试套件
 
 ```bash
-python -m unittest discover -s tests
+python3 -B -m unittest discover -s tests -v
 ```
-执行全部 12 项单元测试，覆盖规则判定、依赖保护、身份清洗与边界闭包。
+执行全部 149 项自动化单元与端到端验收测试（覆盖正反向树投影、完整私有补集不变量、`.old` 隔离解密与回滚、五态远端探测恢复、OS 进程锁、内容规范化与零副作用演练）。
 
 
 

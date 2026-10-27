@@ -1,11 +1,28 @@
-import re
 import fnmatch
-from typing import Dict, List, Tuple, Optional
+import re
+from typing import Callable, Dict, List, Optional, Tuple
+
+from engine.content_normalizer import ContentNormalizer
+from engine.path_validator import (
+    ALLOWED_SHARED_BLOB_MODES,
+    ALLOWED_SHARED_MODES,
+    CaseFoldedNamespaceTrie,
+    NamespaceCollisionError,
+    PathValidationError,
+    collect_ancestor_dirs,
+    validate_platform_rel_path,
+)
+
+
+class ExportTreeComplianceError(Exception):
+    pass
+
 
 class ExcludeDecision:
     PRUNE = "PRUNE"
     BLOCK_REVIEW = "BLOCK_REVIEW"
     ALLOW = "ALLOW"
+
 
 class ExcludeEngine:
     def __init__(self, manifest: dict, exclude_rules: dict):
@@ -13,20 +30,25 @@ class ExcludeEngine:
         self.exclude_rules = exclude_rules
         self.rules = exclude_rules.get("rules", [])
         self.dependency_exceptions = {
-            item["path"]: item for item in exclude_rules.get("approved_dependency_exceptions", [])
+            item["path"]: item
+            for item in exclude_rules.get("approved_dependency_exceptions", [])
         }
         self.content_scanner_cfg = exclude_rules.get("content_scanner", {})
         self.content_patterns = []
         for p in self.content_scanner_cfg.get("patterns", []):
             try:
-                self.content_patterns.append({
-                    "name": p["name"],
-                    "regex": re.compile(p["pattern"]),
-                    "severity": p.get("severity", "BLOCK")
-                })
-            except re.error as e:
+                self.content_patterns.append(
+                    {
+                        "name": p["name"],
+                        "regex": re.compile(p["pattern"]),
+                        "severity": p.get("severity", "BLOCK"),
+                    }
+                )
+            except re.error:
                 pass
-        self.copyright_exceptions = self.content_scanner_cfg.get("approved_copyright_exceptions", [])
+        self.copyright_exceptions = self.content_scanner_cfg.get(
+            "approved_copyright_exceptions", []
+        )
         self.audit_records = []
 
     def _expand_braces(self, pattern: str) -> List[str]:
@@ -34,8 +56,8 @@ class ExcludeEngine:
         m = re.search(r"\{([^}]+)\}", pattern)
         if not m:
             return [pattern]
-        prefix = pattern[:m.start()]
-        suffix = pattern[m.end():]
+        prefix = pattern[: m.start()]
+        suffix = pattern[m.end() :]
         options = m.group(1).split(",")
         res = []
         for opt in options:
@@ -43,35 +65,61 @@ class ExcludeEngine:
             res.extend(self._expand_braces(sub))
         return res
 
-    def evaluate_path(self, path: str, mode: str = "100644") -> Tuple[str, str, Optional[str]]:
-        # Returns: (Decision, rule_id, reason)
-        # 1. Check approved dependency exceptions first
-        if path in self.dependency_exceptions:
+    def evaluate_single_node(
+        self, path: str, mode: str = "100644"
+    ) -> Tuple[str, str, Optional[str]]:
+        """
+        Node-level policy evaluation for a single path (directory prefix or leaf)
+        using case-insensitive pattern/prefix matching and exact-match dependency exceptions.
+        """
+        # 1. Exact-match approved dependency exceptions (only for regular/executable blobs)
+        if path in self.dependency_exceptions and mode in ALLOWED_SHARED_BLOB_MODES:
             item = self.dependency_exceptions[path]
-            return ExcludeDecision.ALLOW, "APPROVED_DEPENDENCY_EXCEPTION", item.get("reason", "")
+            return (
+                ExcludeDecision.ALLOW,
+                "APPROVED_DEPENDENCY_EXCEPTION",
+                item.get("reason", ""),
+            )
 
-        # 2. Hard manifest check: explicit forbidden prefixes
+        path_lower = path.lower()
+        basename_lower = path_lower.split("/")[-1]
+
+        # 2. Hard manifest check: explicit forbidden prefixes (case-insensitive)
         for prefix in self.manifest.get("explicit_forbidden_prefixes", []):
-            if path.startswith(prefix):
-                return ExcludeDecision.PRUNE, "MANIFEST_EXPLICIT_FORBIDDEN", f"Prefix forbidden: {prefix}"
+            prefix_lower = prefix.lower()
+            prefix_clean = prefix_lower.rstrip("/")
+            if path_lower.startswith(prefix_lower) or path_lower == prefix_clean:
+                return (
+                    ExcludeDecision.PRUNE,
+                    "MANIFEST_EXPLICIT_FORBIDDEN",
+                    f"Prefix forbidden: {prefix}",
+                )
 
-        # 3. App scope check
+        # 3. App scope check (case-insensitive)
         app_scope = self.manifest.get("app_scope", {})
-        allowed_apps = set(app_scope.get("allowed_apps", []))
-        allowed_files = set(app_scope.get("allowed_files", []))
-        if path.startswith("app/"):
-            parts = path.split("/")
-            if len(parts) >= 2:
-                sub = parts[1]
-                if len(parts) == 2 and sub in allowed_files:
+        allowed_apps = {a.lower() for a in app_scope.get("allowed_apps", [])}
+        allowed_files = {f.lower() for f in app_scope.get("allowed_files", [])}
+        if path_lower.startswith("app/"):
+            parts_orig = path.split("/")
+            parts_lower = path_lower.split("/")
+            if len(parts_lower) >= 2:
+                sub_lower = parts_lower[1]
+                if (
+                    len(parts_lower) == 2
+                    and not mode.startswith("04")
+                    and sub_lower in allowed_files
+                ):
                     pass
-                elif sub in allowed_apps:
+                elif sub_lower in allowed_apps:
                     pass
                 else:
-                    return ExcludeDecision.PRUNE, "APP_SCOPE_RESTRICTED", f"Non-allowed app: {sub}"
+                    return (
+                        ExcludeDecision.PRUNE,
+                        "APP_SCOPE_RESTRICTED",
+                        f"Non-allowed app: {parts_orig[1]}",
+                    )
 
-        # 4. Exclude rules evaluation
-        basename = path.split("/")[-1]
+        # 4. Exclude rules evaluation (case-insensitive)
         for rule in self.rules:
             action = rule.get("action", ExcludeDecision.PRUNE)
             category = rule.get("category", "")
@@ -80,91 +128,225 @@ class ExcludeEngine:
             expanded = self._expand_braces(raw_pattern)
 
             for pat in expanded:
+                pat_lower = pat.lower()
                 matched = False
                 if category == "PATH":
-                    # Handle app/!(mickey_smart|Makefile)/** style
-                    if "!(" in pat:
-                        if path.startswith("app/"):
-                            parts = path.split("/")
-                            if len(parts) >= 2 and parts[1] not in ("mickey_smart", "Makefile"):
+                    if "!(" in pat_lower:
+                        if path_lower.startswith("app/"):
+                            parts_lower = path_lower.split("/")
+                            if len(parts_lower) >= 2 and parts_lower[1] not in (
+                                "mickey_smart",
+                                "makefile",
+                            ):
                                 matched = True
-                    elif pat.startswith("**/"):
-                        sub_pat = pat[3:]
-                        if fnmatch.fnmatchcase(path, pat) or fnmatch.fnmatchcase(path, f"*{sub_pat}"):
-                            matched = True
-                    elif pat.endswith("/**"):
-                        prefix = pat[:-3]
-                        if path.startswith(f"{prefix}/") or path == prefix:
+                    elif pat_lower.startswith("**/"):
+                        sub_pat = pat_lower[3:]
+                        if sub_pat.endswith("/**"):
+                            dir_name = sub_pat[:-3]
+                            if (
+                                fnmatch.fnmatchcase(path_lower, pat_lower)
+                                or fnmatch.fnmatchcase(path_lower, f"*{sub_pat}")
+                                or path_lower == dir_name
+                                or path_lower.startswith(f"{dir_name}/")
+                                or path_lower.endswith(f"/{dir_name}")
+                                or f"/{dir_name}/" in path_lower
+                            ):
+                                matched = True
+                        else:
+                            if (
+                                fnmatch.fnmatchcase(path_lower, pat_lower)
+                                or fnmatch.fnmatchcase(path_lower, f"*{sub_pat}")
+                                or fnmatch.fnmatchcase(basename_lower, sub_pat)
+                            ):
+                                matched = True
+                    elif pat_lower.endswith("/**"):
+                        prefix = pat_lower[:-3]
+                        if path_lower.startswith(f"{prefix}/") or path_lower == prefix:
                             matched = True
                     else:
-                        if fnmatch.fnmatchcase(path, pat):
+                        if fnmatch.fnmatchcase(path_lower, pat_lower):
                             matched = True
                 elif category == "FILENAME":
-                    if fnmatch.fnmatchcase(basename, pat):
+                    if fnmatch.fnmatchcase(basename_lower, pat_lower):
                         matched = True
 
                 if matched:
                     return action, rule_id, rule.get("description", "")
 
-        # 5. Manifest roots allowlist check
-        allowed_roots = set(self.manifest.get("allowed_roots", []))
-        root_files = set(self.manifest.get("root_files_allowlist", []))
-        top = path.split("/")[0]
-        if "/" not in path:
-            if mode.startswith("04") or path in allowed_roots or path == "app":
-                if path in allowed_roots or path == "app":
+        # 5. Manifest roots allowlist check (case-insensitive)
+        allowed_roots = {r.lower() for r in self.manifest.get("allowed_roots", [])}
+        root_files = {f.lower() for f in self.manifest.get("root_files_allowlist", [])}
+        top_lower = path_lower.split("/")[0]
+        top_orig = path.split("/")[0]
+        if "/" not in path_lower:
+            if (
+                mode.startswith("04")
+                or path_lower in allowed_roots
+                or path_lower == "app"
+            ):
+                if path_lower in allowed_roots or path_lower == "app":
                     return ExcludeDecision.ALLOW, "ROOT_DIR_ALLOWLISTED", ""
                 else:
-                    return ExcludeDecision.PRUNE, "ROOT_DIR_NOT_ALLOWLISTED", f"Root directory not in allowlist: {path}"
+                    return (
+                        ExcludeDecision.PRUNE,
+                        "ROOT_DIR_NOT_ALLOWLISTED",
+                        f"Root directory not in allowlist: {path}",
+                    )
             else:
-                if path not in root_files:
-                    return ExcludeDecision.PRUNE, "ROOT_FILE_NOT_ALLOWLISTED", f"Root file not in allowlist: {path}"
+                if path_lower not in root_files:
+                    return (
+                        ExcludeDecision.PRUNE,
+                        "ROOT_FILE_NOT_ALLOWLISTED",
+                        f"Root file not in allowlist: {path}",
+                    )
         else:
-            if top not in allowed_roots and top != "app":
-                return ExcludeDecision.PRUNE, "ROOT_DIR_NOT_ALLOWLISTED", f"Root directory not in allowlist: {top}"
+            if top_lower not in allowed_roots and top_lower != "app":
+                return (
+                    ExcludeDecision.PRUNE,
+                    "ROOT_DIR_NOT_ALLOWLISTED",
+                    f"Root directory not in allowlist: {top_orig}",
+                )
 
-        return ExcludeDecision.ALLOW, "DEFAULT_ALLOW", "Passed manifest and exclude rules"
+        return (
+            ExcludeDecision.ALLOW,
+            "DEFAULT_ALLOW",
+            "Passed manifest and exclude rules",
+        )
+
+    def evaluate_effective_path(
+        self, path: str, mode: str = "100644", is_tree: bool = False
+    ) -> Tuple[str, str, Optional[str]]:
+        """
+        Unified Contract 1 decision function (Section 2.2):
+        - Exact-match approved_dependency_exceptions with mode in ('100644', '100755') -> ALLOW
+        - Ancestor-accumulated evaluation from root to leaf:
+          any BLOCK_REVIEW -> BLOCK_REVIEW; else any PRUNE -> PRUNE
+        - Platform path validation:
+          if invalid, PRUNE if in PRUNE domain else BLOCK_REVIEW (INVALID_PLATFORM_PATH)
+        - Mode matrix check:
+          if mode not in ('100644', '100755', '040000'), PRUNE if mode == '120000' and in PRUNE domain
+          else BLOCK_REVIEW (UNSUPPORTED_SHARED_GIT_MODE)
+        """
+        effective_mode = "040000" if (is_tree and mode == "100644") else mode
+
+        platform_valid = True
+        platform_err = ""
+        try:
+            validate_platform_rel_path(path)
+        except PathValidationError as e:
+            platform_valid = False
+            platform_err = str(e)
+
+        # 1. Exact-match approved dependency exceptions for valid blob modes
+        if (
+            platform_valid
+            and path in self.dependency_exceptions
+            and effective_mode in ALLOWED_SHARED_BLOB_MODES
+        ):
+            item = self.dependency_exceptions[path]
+            return (
+                ExcludeDecision.ALLOW,
+                "APPROVED_DEPENDENCY_EXCEPTION",
+                item.get("reason", ""),
+            )
+
+        # 2. Evaluate all ancestor directory prefixes and the leaf node
+        ancestors = collect_ancestor_dirs(path) if path else []
+        first_block: Optional[Tuple[str, str, Optional[str]]] = None
+        first_prune: Optional[Tuple[str, str, Optional[str]]] = None
+
+        for anc in ancestors:
+            dec, rule_id, reason = self.evaluate_single_node(anc, mode="040000")
+            if dec == ExcludeDecision.BLOCK_REVIEW and first_block is None:
+                first_block = (dec, rule_id, f"Ancestor '{anc}' blocked: {reason}")
+            elif dec == ExcludeDecision.PRUNE and first_prune is None:
+                first_prune = (dec, rule_id, f"Ancestor '{anc}' pruned: {reason}")
+
+        leaf_dec, leaf_rule_id, leaf_reason = self.evaluate_single_node(
+            path, mode=effective_mode
+        )
+        if leaf_dec == ExcludeDecision.BLOCK_REVIEW and first_block is None:
+            first_block = (leaf_dec, leaf_rule_id, leaf_reason)
+        elif leaf_dec == ExcludeDecision.PRUNE and first_prune is None:
+            first_prune = (leaf_dec, leaf_rule_id, leaf_reason)
+
+        if first_block is not None:
+            return first_block
+
+        if first_prune is not None:
+            if (
+                effective_mode not in ALLOWED_SHARED_MODES
+                and effective_mode != "120000"
+            ):
+                return (
+                    ExcludeDecision.BLOCK_REVIEW,
+                    "UNSUPPORTED_SHARED_GIT_MODE",
+                    f"Unsupported git mode '{effective_mode}' at '{path}'",
+                )
+            return first_prune
+
+        # 3. Path is in shared ALLOW domain; enforce platform validity and mode support matrix
+        if not platform_valid:
+            return (
+                ExcludeDecision.BLOCK_REVIEW,
+                "INVALID_PLATFORM_PATH",
+                platform_err,
+            )
+
+        if effective_mode not in ALLOWED_SHARED_MODES:
+            return (
+                ExcludeDecision.BLOCK_REVIEW,
+                "UNSUPPORTED_SHARED_GIT_MODE",
+                f"Unsupported git mode '{effective_mode}' for shared path '{path}'",
+            )
+
+        return leaf_dec, leaf_rule_id, leaf_reason
+
+    def evaluate_path(
+        self, path: str, mode: str = "100644"
+    ) -> Tuple[str, str, Optional[str]]:
+        """
+        Unified entry point delegating to evaluate_effective_path so all callers
+        share ancestor-accumulated semantics, platform path validation, and mode checks.
+        """
+        return self.evaluate_effective_path(
+            path, mode=mode, is_tree=mode.startswith("04")
+        )
 
     def is_path_in_content_scan_scope(self, path: str) -> bool:
         if not self.content_scanner_cfg.get("enabled", False):
             return False
+        path_lower = path.lower()
         for pat in self.content_scanner_cfg.get("scan_scope", []):
-            if pat.endswith("/**"):
-                prefix = pat[:-3]
-                if path.startswith(f"{prefix}/") or path == prefix:
+            pat_lower = pat.lower()
+            if pat_lower.endswith("/**"):
+                prefix = pat_lower[:-3]
+                if path_lower.startswith(f"{prefix}/") or path_lower == prefix:
                     return True
-            elif fnmatch.fnmatchcase(path, pat):
+            elif fnmatch.fnmatchcase(path_lower, pat_lower):
                 return True
         return False
 
     def is_copyright_exempt(self, path: str) -> bool:
+        path_lower = path.lower()
         for pat in self.copyright_exceptions:
-            if pat.endswith("/**"):
-                prefix = pat[:-3]
-                if path.startswith(f"{prefix}/") or path == prefix:
+            pat_lower = pat.lower()
+            if pat_lower.endswith("/**"):
+                prefix = pat_lower[:-3]
+                if path_lower.startswith(f"{prefix}/") or path_lower == prefix:
                     return True
-            elif fnmatch.fnmatchcase(path, pat):
+            elif fnmatch.fnmatchcase(path_lower, pat_lower):
                 return True
         return False
 
-    def scan_content_blob(self, path: str, blob_bytes: bytes) -> Tuple[bool, Optional[str], Optional[str]]:
+    def scan_content_blob(
+        self, path: str, blob_bytes: bytes
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
         # Returns: (passed, violated_rule_name, redacted_hint)
         if not self.content_scanner_cfg.get("enabled", False):
             return True, None, None
 
-        # Check if in scan scope
-        in_scope = False
-        for pat in self.content_scanner_cfg.get("scan_scope", []):
-            if pat.endswith("/**"):
-                prefix = pat[:-3]
-                if path.startswith(f"{prefix}/") or path == prefix:
-                    in_scope = True
-                    break
-            elif fnmatch.fnmatchcase(path, pat):
-                in_scope = True
-                break
-
-        if not in_scope:
+        if not self.is_path_in_content_scan_scope(path):
             return True, None, None
 
         # Check copyright exemption
@@ -185,17 +367,123 @@ class ExcludeEngine:
             m = regex.search(text)
             if m:
                 # Calculate line number
-                line_no = text[:m.start()].count("\n") + 1
+                line_no = text[: m.start()].count("\n") + 1
                 redacted_hint = f"Matched {name} at line {line_no} (value redacted)"
                 return False, name, redacted_hint
 
         return True, None, None
 
-    def record_audit(self, commit_oid: str, path: str, decision: str, rule_id: str, details: str):
-        self.audit_records.append({
-            "commit_oid": commit_oid,
-            "path": path,
-            "decision": decision,
-            "rule_id": rule_id,
-            "details": details
-        })
+    def compute_shared_norm(
+        self,
+        git_adapter,
+        tree_oid: str,
+        normalizer: Optional[ContentNormalizer] = None,
+        decrypt_fn: Optional[Callable[[bytes], bytes]] = None,
+    ) -> Dict[str, Tuple[str, str]]:
+        """
+        Computes SharedNorm(T) -> {path: (mode, canon_hash)} for all ALLOW blobs in tree_oid.
+        """
+        norm = normalizer if normalizer is not None else ContentNormalizer()
+        ls_fn = getattr(git_adapter, "ls_tree_r_z_strict", git_adapter.ls_tree_r_z)
+        entries = ls_fn(tree_oid)
+        shared_norm: Dict[str, Tuple[str, str]] = {}
+
+        for entry in entries:
+            path = entry["path"]
+            mode = entry["mode"]
+            oid = entry["oid"]
+            entry_type = entry.get("type", "blob")
+            is_tree = (entry_type == "tree") or mode.startswith("04")
+
+            decision, _, _ = self.evaluate_effective_path(
+                path, mode=mode, is_tree=is_tree
+            )
+            if decision != ExcludeDecision.ALLOW or is_tree:
+                continue
+
+            raw_bytes = git_adapter.cat_file_blob(oid)
+            plain_bytes = decrypt_fn(raw_bytes) if decrypt_fn is not None else raw_bytes
+            chash = norm.canon_hash(path, plain_bytes)
+            shared_norm[path] = (mode, chash)
+
+        return shared_norm
+
+    def validate_export_tree(
+        self,
+        git_adapter,
+        tree_oid: str,
+        decrypt_fn: Optional[Callable[[bytes], bytes]] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Implements ValidateExportTree(T_B) from Section 2.4:
+        Verifies every entry in tree_oid:
+        1) passes validate_platform_rel_path and fits CaseFoldedNamespaceTrie without collision
+        2) has evaluate_effective_path == ALLOW (no PRUNE or BLOCK_REVIEW leaks)
+        3) passes scan_content_blob for all entries in content scan scope
+        Returns: (passed, details)
+        """
+        trie = CaseFoldedNamespaceTrie()
+        ls_fn = getattr(git_adapter, "ls_tree_r_z_strict", git_adapter.ls_tree_r_z)
+        entries = ls_fn(tree_oid)
+
+        for entry in entries:
+            path = entry["path"]
+            mode = entry["mode"]
+            oid = entry["oid"]
+            entry_type = entry.get("type", "blob")
+            is_tree = (entry_type == "tree") or mode.startswith("04")
+
+            try:
+                validate_platform_rel_path(path)
+            except PathValidationError as e:
+                return (
+                    False,
+                    f"Invalid platform path '{path}' in export tree {tree_oid}: {e}",
+                )
+
+            if not is_tree:
+                try:
+                    trie.insert_path(path, origin_tag="EXPORT")
+                except NamespaceCollisionError as e:
+                    return (
+                        False,
+                        f"Namespace collision in export tree {tree_oid} at '{path}': {e}",
+                    )
+
+            decision, rule_id, reason = self.evaluate_effective_path(
+                path, mode=mode, is_tree=is_tree
+            )
+            if decision != ExcludeDecision.ALLOW:
+                return (
+                    False,
+                    f"Export tree {tree_oid} contains non-exportable path '{path}' "
+                    f"(decision={decision}, rule={rule_id}): {reason}",
+                )
+
+            if not is_tree and self.is_path_in_content_scan_scope(path):
+                raw_bytes = git_adapter.cat_file_blob(oid)
+                plain_bytes = (
+                    decrypt_fn(raw_bytes) if decrypt_fn is not None else raw_bytes
+                )
+                passed, rule_name, hint = self.scan_content_blob(path, plain_bytes)
+                if not passed:
+                    return (
+                        False,
+                        f"Export tree {tree_oid} failed content scan at '{path}' "
+                        f"(rule={rule_name}): {hint}",
+                    )
+
+        return True, "EXPORT_TREE_VALID"
+
+    def record_audit(
+        self, commit_oid: str, path: str, decision: str, rule_id: str, details: str
+    ):
+        self.audit_records.append(
+            {
+                "commit_oid": commit_oid,
+                "path": path,
+                "decision": decision,
+                "rule_id": rule_id,
+                "details": details,
+            }
+        )

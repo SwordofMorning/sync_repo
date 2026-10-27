@@ -1,207 +1,210 @@
-import os
-import re
-import subprocess
-from typing import Dict, List, Tuple, Set
-from engine.git_adapter import GitAdapter, GitError
-from engine.exclude_engine import ExcludeEngine, ExcludeDecision
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+from engine.content_normalizer import ContentNormalizer
+from engine.exclude_engine import ExcludeDecision, ExcludeEngine
+from engine.git_adapter import GitAdapter
+from engine.path_validator import (
+    ALLOWED_SHARED_BLOB_MODES,
+    CaseFoldedNamespaceTrie,
+    NamespaceCollisionError,
+    PathValidationError,
+    validate_platform_rel_path,
+)
+
 
 class TreeProjectionError(Exception):
     pass
 
+
+class SecurityBlockError(TreeProjectionError):
+    pass
+
+
 class TreeProjector:
-    def __init__(self, source_git: GitAdapter, target_git: GitAdapter, exclude_engine: ExcludeEngine):
+    def __init__(
+        self,
+        source_git: GitAdapter,
+        target_git: GitAdapter,
+        exclude_engine: ExcludeEngine,
+        policy_digest: str = "default",
+        normalizer: Optional[ContentNormalizer] = None,
+        target_env: Optional[dict] = None,
+    ):
         self.source_git = source_git
         self.target_git = target_git
         self.exclude_engine = exclude_engine
+        self.policy_digest = policy_digest
+        self.normalizer = normalizer if normalizer is not None else ContentNormalizer()
+        self.target_env = dict(target_env) if target_env is not None else None
+        # Retained for legacy callers; the compatibility pre-check never imports objects.
         self.objects_streamed = False
-        # 记录包含被 PRUNE 文件的目录前缀，仅对这些目录执行递归过滤
-        self.dirty_dirs: Set[str] = {"docs"}
-        self._subtree_cache: Dict[Tuple[str, str], str] = {}
+        self._subtree_cache: Dict[Tuple[str, str, str], Optional[str]] = {}
+        self._preflight_cache: Dict[Tuple[str, str, str], Tuple[str, ...]] = {}
+        self._verified_scans: Set[Tuple[str, str, str]] = set()
+        self._audited_decisions: Set[Tuple[str, str, str, str]] = set()
+        self._projection_depth = 0
 
-    def _mark_dirty_ancestors(self, path: str):
-        parts = path.split("/")
-        for i in range(1, len(parts)):
-            self.dirty_dirs.add("/".join(parts[:i]))
+    def _audit_decision(
+        self, commit_oid: str, path: str, decision: str, rule_id: str, reason: Optional[str]
+    ) -> None:
+        key = (commit_oid, path, decision, rule_id)
+        if key not in self._audited_decisions:
+            self.exclude_engine.record_audit(commit_oid, path, decision, rule_id, reason or "")
+            self._audited_decisions.add(key)
 
-    def stream_approved_objects(self, base_commit: str, tip_commit: str):
-        """
-        Streams approved objects from source to target using native Git pack pipe.
-        Ensures target export store has all approved Blobs and Subtrees without unapproved items.
-        """
-        if self.objects_streamed:
-            return
+    def _check_entry(self, commit_oid: str, child_path: str, entry: dict) -> str:
+        mode_str, type_str = entry["mode"], entry["type"]
+        decision, rule_id, reason = self.exclude_engine.evaluate_effective_path(
+            child_path, mode=mode_str, is_tree=(type_str == "tree")
+        )
+        if decision in (ExcludeDecision.PRUNE, ExcludeDecision.BLOCK_REVIEW):
+            self._audit_decision(commit_oid, child_path, decision, rule_id, reason)
+            if decision == ExcludeDecision.BLOCK_REVIEW:
+                raise SecurityBlockError(f"Blocked '{child_path}' ({rule_id}): {reason}")
+            return decision
+        if decision != ExcludeDecision.ALLOW:
+            raise SecurityBlockError(f"Unknown policy decision for '{child_path}': {decision}")
 
-        # 1. Collect all objects created in the pending range
-        raw_objs = self.source_git._run(["rev-list", "--objects", f"{base_commit}..{tip_commit}"])[0]
-        approved_oids = []
-
-        for line in raw_objs.decode("utf-8", errors="replace").strip().splitlines():
-            if not line:
-                continue
-            parts = line.split(maxsplit=1)
-            oid = parts[0]
-            path = parts[1] if len(parts) > 1 else ""
-
-            # 跳过源库 Commit 对象和未脱敏的根 Tree 对象
-            if not path:
-                continue
-
-            decision, _, _ = self.exclude_engine.evaluate_path(path)
-            if decision == ExcludeDecision.PRUNE:
-                self._mark_dirty_ancestors(path)
-                continue
-
-            approved_oids.append(oid)
-
-        # 2. Pipe approved objects into target repo
-        if approved_oids:
-            oids_data = "\n".join(approved_oids).encode("ascii") + b"\n"
-            p_pack = subprocess.Popen(
-                ["git", "-C", self.source_git.repo_dir, "pack-objects", "--stdout"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        try:
+            validate_platform_rel_path(child_path)
+        except PathValidationError as exc:
+            self._audit_decision(
+                commit_oid, child_path, ExcludeDecision.BLOCK_REVIEW,
+                "INVALID_PLATFORM_PATH", str(exc),
             )
-            pack_data, pack_err = p_pack.communicate(input=oids_data)
-            if p_pack.returncode != 0:
-                raise TreeProjectionError(f"Failed to pack approved objects: {pack_err.decode(errors='replace')}")
-
-            p_unpack = subprocess.Popen(
-                ["git", "-C", self.target_git.repo_dir, "unpack-objects"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            raise SecurityBlockError(str(exc)) from exc
+        if not (
+            (type_str == "tree" and mode_str == "040000")
+            or (type_str == "blob" and mode_str in ALLOWED_SHARED_BLOB_MODES)
+        ):
+            self._audit_decision(
+                commit_oid, child_path, ExcludeDecision.BLOCK_REVIEW,
+                "UNSUPPORTED_SHARED_GIT_MODE", f"Unsupported {mode_str} {type_str}",
             )
-            _, unpack_err = p_unpack.communicate(input=pack_data)
-            if p_unpack.returncode != 0:
-                raise TreeProjectionError(f"Failed to unpack approved objects: {unpack_err.decode(errors='replace')}")
+            raise SecurityBlockError(
+                f"Unsupported shared Git entry at '{child_path}': {mode_str} {type_str}"
+            )
+        return decision
 
+    def _verify_and_scan_blob(self, commit_oid: str, child_path: str, oid_str: str) -> bytes:
+        blob_bytes = self.source_git.cat_file_blob(oid_str)
+        key = (child_path, oid_str, self.policy_digest)
+        if (
+            self.exclude_engine.is_path_in_content_scan_scope(child_path)
+            and key not in self._verified_scans
+        ):
+            passed, rule_id, hint = self.exclude_engine.scan_content_blob(child_path, blob_bytes)
+            if not passed:
+                self._audit_decision(
+                    commit_oid, child_path, ExcludeDecision.BLOCK_REVIEW,
+                    rule_id or "CONTENT_SCAN_FAILED", hint,
+                )
+                raise SecurityBlockError(
+                    f"Content scan blocked '{child_path}' ({rule_id}): {hint}"
+                )
+            self._verified_scans.add(key)
+        return blob_bytes
+
+    def _preflight_subtree(
+        self, commit_oid: str, rel_dir: str, src_tree_oid: str
+    ) -> Tuple[str, ...]:
+        """Read-only authorization of the entire subtree, including historical blobs."""
+        key = (rel_dir, src_tree_oid, self.policy_digest)
+        if key in self._preflight_cache:
+            return self._preflight_cache[key]
+        paths: List[str] = []
+        # ls_tree_z uses checked Git I/O and strict UTF-8. Failures are never cached.
+        for entry in self.source_git.ls_tree_z(src_tree_oid):
+            child_path = f"{rel_dir}/{entry['name']}" if rel_dir else entry["name"]
+            if self._check_entry(commit_oid, child_path, entry) == ExcludeDecision.PRUNE:
+                continue
+            if entry["type"] == "tree":
+                paths.extend(self._preflight_subtree(commit_oid, child_path, entry["oid"]))
+            else:
+                self._verify_and_scan_blob(commit_oid, child_path, entry["oid"])
+                paths.append(child_path)
+        result = tuple(paths)
+        self._preflight_cache[key] = result
+        return result
+
+    @staticmethod
+    def _verify_namespace(paths: Iterable[str]) -> None:
+        trie = CaseFoldedNamespaceTrie()
+        try:
+            for path in paths:
+                trie.insert_path(path, origin_tag="SHARED")
+        except NamespaceCollisionError as exc:
+            raise SecurityBlockError(f"Projected namespace is not representable: {exc}") from exc
+
+    def stream_approved_objects(self, base_commit: str, tip_commit: str) -> None:
+        """Compatibility entry point: pre-check the range without copying any closure.
+
+        Every pending snapshot is checked, so a leak introduced and subsequently
+        removed in this range is still rejected. No commits, raw source trees, or
+        unapproved blobs are ever packed/imported by this method.
+        """
+        for commit_oid in self.source_git.rev_list_topo(base_commit, tip_commit):
+            tree_oid = self.source_git.rev_parse(f"{commit_oid}^{{tree}}")
+            self._verify_namespace(self._preflight_subtree(commit_oid, "", tree_oid))
         self.objects_streamed = True
 
-    def _safe_mktree_z(self, records: List[Tuple[str, str, str, str]]) -> str:
-        """
-        Calls target_git.mktree_z. If a historical object is missing in target_git,
-        streams that missing object tree/blob from source_git on-demand and retries.
-        """
-        while True:
-            try:
-                return self.target_git.mktree_z(records)
-            except GitError as e:
-                m = re.search(r"object ([0-9a-f]{40}) is unavailable", str(e))
-                if not m:
-                    raise
-                missing_oid = m.group(1)
-                self._copy_missing_object_closure(missing_oid)
-
-    def _copy_missing_object_closure(self, oid: str):
-        """Copies a missing blob or subtree from source_git to target_git via pack-objects."""
-        raw_objs = self.source_git._run(["rev-list", "--objects", oid])[0]
-        oids_to_pack = []
-        for line in raw_objs.decode("utf-8", errors="replace").strip().splitlines():
-            if not line:
-                continue
-            oids_to_pack.append(line.split(maxsplit=1)[0])
-
-        if oids_to_pack:
-            oids_data = "\n".join(oids_to_pack).encode("ascii") + b"\n"
-            p_pack = subprocess.Popen(
-                ["git", "-C", self.source_git.repo_dir, "pack-objects", "--stdout"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            pack_data, _ = p_pack.communicate(input=oids_data)
-            p_unpack = subprocess.Popen(
-                ["git", "-C", self.target_git.repo_dir, "unpack-objects"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            p_unpack.communicate(input=pack_data)
-
     def project_commit_tree(self, commit_oid: str) -> str:
+        """Project a complete source snapshot, independent of the changed-path set."""
+        src_tree_oid = self.source_git.rev_parse(f"{commit_oid}^{{tree}}")
+        projected_root_tree_oid = self._project_subtree(commit_oid, "", src_tree_oid)
+        if projected_root_tree_oid is None:
+            raise TreeProjectionError("Root projection unexpectedly omitted the root tree")
+        self._verify_namespace(
+            entry["path"] for entry in self.target_git.ls_tree_r_z_strict(
+                projected_root_tree_oid, env=self.target_env
+            )
+        )
+        return projected_root_tree_oid
+
+    def _project_subtree(
+        self, commit_oid: str, rel_dir: str, src_tree_oid: str
+    ) -> Optional[str]:
+        """Recursively rebuild only approved entries, memoized by path and policy.
+
+        Preflight precedes the first target write, including when this helper is
+        called directly. Thus a later BLOCK_REVIEW/content failure cannot leave
+        even an earlier approved object imported by this projection attempt.
         """
-        Projects a clean, excluded Git Tree for commit_oid directly into target object store.
-        Returns: projected_root_tree_oid
-        """
-        root_entries = self.source_git._run(["ls-tree", "-z", f"{commit_oid}^{{tree}}"])[0].split(b"\0")
-        safe_root = []
+        if self._projection_depth == 0:
+            self._verify_namespace(self._preflight_subtree(commit_oid, rel_dir, src_tree_oid))
+        key = (rel_dir, src_tree_oid, self.policy_digest)
+        if key in self._subtree_cache:
+            return self._subtree_cache[key]
 
-        for entry in root_entries:
-            if not entry:
-                continue
-            meta, path_b = entry.split(b"\t", 1)
-            path_str = path_b.decode("utf-8", errors="replace")
-            m, t, o = meta.split()
-            mode_str = m.decode("ascii")
-            type_str = t.decode("ascii")
-            oid_str = o.decode("ascii")
-
-            # Check root-level exclusions (e.g. gwp_debug)
-            decision, rule_id, details = self.exclude_engine.evaluate_path(path_str, mode=mode_str)
-            if decision == ExcludeDecision.PRUNE:
-                self.exclude_engine.record_audit(commit_oid, path_str, "PRUNE", rule_id, details)
-                continue
-
-            if path_str == "app":
-                # Handle app directory: keep only mickey_smart and Makefile
-                app_entries = self.source_git._run(["ls-tree", "-z", oid_str])[0].split(b"\0")
-                filtered_app = []
-                for ae in app_entries:
-                    if not ae:
-                        continue
-                    ameta, apath_b = ae.split(b"\t", 1)
-                    apath_str = apath_b.decode("utf-8", errors="replace")
-                    app_full_path = f"app/{apath_str}"
-                    am, at, ao = ameta.split()
-                    am_str = am.decode("ascii")
-                    at_str = at.decode("ascii")
-                    ao_str = ao.decode("ascii")
-
-                    dec, rid, det = self.exclude_engine.evaluate_path(app_full_path, mode=am_str)
-                    if dec == ExcludeDecision.PRUNE:
-                        self.exclude_engine.record_audit(commit_oid, app_full_path, "PRUNE", rid, det)
-                        continue
-
-                    if at_str == "tree" and app_full_path in self.dirty_dirs:
-                        ao_str = self._filter_subtree(commit_oid, app_full_path, ao_str)
-
-                    filtered_app.append((am_str, at_str, ao_str, apath_str))
-
-                new_app_oid = self._safe_mktree_z(filtered_app)
-                safe_root.append(("040000", "tree", new_app_oid, "app"))
-
-            elif type_str == "tree" and path_str in self.dirty_dirs:
-                new_sub_oid = self._filter_subtree(commit_oid, path_str, oid_str)
-                safe_root.append((mode_str, "tree", new_sub_oid, path_str))
-
-            else:
-                safe_root.append((mode_str, type_str, oid_str, path_str))
-
-        root_tree_oid = self._safe_mktree_z(safe_root)
-        return root_tree_oid
-
-    def _filter_subtree(self, commit_oid: str, dir_path: str, tree_oid: str) -> str:
-        cache_key = (dir_path, tree_oid)
-        if cache_key in self._subtree_cache:
-            return self._subtree_cache[cache_key]
-
-        entries = self.source_git._run(["ls-tree", "-z", tree_oid])[0].split(b"\0")
-        filtered = []
-        for entry in entries:
-            if not entry:
-                continue
-            meta, path_b = entry.split(b"\t", 1)
-            name_str = path_b.decode("utf-8", errors="replace")
-            full_path = f"{dir_path}/{name_str}"
-            m, t, o = meta.split()
-            mode_str = m.decode("ascii")
-            type_str = t.decode("ascii")
-            oid_str = o.decode("ascii")
-
-            if type_str == "tree":
-                if full_path in self.dirty_dirs:
-                    oid_str = self._filter_subtree(commit_oid, full_path, oid_str)
-                filtered.append((mode_str, type_str, oid_str, name_str))
-            else:
-                dec, rid, det = self.exclude_engine.evaluate_path(full_path, mode=mode_str)
-                if dec == ExcludeDecision.PRUNE:
-                    self.exclude_engine.record_audit(commit_oid, full_path, "PRUNE", rid, det)
+        records: List[Tuple[str, str, str, str]] = []
+        self._projection_depth += 1
+        try:
+            for entry in self.source_git.ls_tree_z(src_tree_oid):
+                name = entry["name"]
+                child_path = f"{rel_dir}/{name}" if rel_dir else name
+                mode_str, type_str, oid_str = entry["mode"], entry["type"], entry["oid"]
+                if self._check_entry(commit_oid, child_path, entry) == ExcludeDecision.PRUNE:
                     continue
-                filtered.append((mode_str, type_str, oid_str, name_str))
-
-        projected_oid = self._safe_mktree_z(filtered)
-        self._subtree_cache[cache_key] = projected_oid
-        return projected_oid
+                if type_str == "tree":
+                    projected_oid = self._project_subtree(commit_oid, child_path, oid_str)
+                    if projected_oid is not None:
+                        records.append((mode_str, type_str, projected_oid, name))
+                else:
+                    blob_bytes = self._verify_and_scan_blob(commit_oid, child_path, oid_str)
+                    canon_bytes = self.normalizer.normalize_for_git_store(
+                        "A2B", child_path, blob_bytes
+                    )
+                    # Write this approved blob alone. Never import its source
+                    # tree/commit closure, even if mktree reports a missing object.
+                    approved_oid = self.target_git.hash_object_write(
+                        canon_bytes, env=self.target_env
+                    )
+                    records.append((mode_str, type_str, approved_oid, name))
+            projected_oid = (
+                self.target_git.mktree_z(records, env=self.target_env)
+                if records or not rel_dir else None
+            )
+            self._subtree_cache[key] = projected_oid
+            return projected_oid
+        finally:
+            self._projection_depth -= 1

@@ -1,12 +1,22 @@
 import re
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
+
 
 class SanitizerError(Exception):
     pass
 
+
 class MetadataSanitizer:
-    def __init__(self, identity_map: Dict[str, str], message_rules: list):
+    def __init__(
+        self,
+        identity_map: Dict[str, str],
+        message_rules: list,
+        approved_external_identities: Optional[List[str]] = None,
+    ):
         self.identity_map = identity_map
+        self.approved_canonical_identities = set(identity_map.values()) | set(
+            approved_external_identities or []
+        )
         self.message_rules = []
         for r in message_rules:
             try:
@@ -17,20 +27,28 @@ class MetadataSanitizer:
             except re.error as e:
                 pass
 
-    def sanitize_identity(self, name: str, email: str) -> Tuple[str, str]:
-        key = f"{name} <{email}>"
-        if key in self.identity_map:
-            mapped = self.identity_map[key]
-            # parse mapped "Name <email>"
-            m = re.match(r"^([^<]+)<([^>]+)>$", mapped.strip())
-            if m:
-                return m.group(1).strip(), m.group(2).strip()
-            return mapped, email
+    @staticmethod
+    def _parse_identity(identity: str) -> Tuple[str, str]:
+        match = re.fullmatch(r"([^<>\r\n\x00]+)<([^<>\r\n\x00]+)>", identity.strip())
+        if match:
+            name, email = match.group(1).strip(), match.group(2).strip()
+            if name and email:
+                return name, email
+        raise SanitizerError(f"Invalid approved identity '{identity}'; expected 'Name <email>'")
 
-        # Fail closed on unknown authors to prevent leaking private emails
+    def sanitize_identity(self, name: str, email: str) -> Tuple[str, str]:
+        key = f"{name.strip()} <{email.strip()}>"
+        if key in self.identity_map:
+            return self._parse_identity(self.identity_map[key])
+        if key in self.approved_canonical_identities:
+            # Exact identities, not domain suffixes, authorize pass-through.
+            self._parse_identity(key)
+            return name.strip(), email.strip()
+
+        # Fail closed even for unknown names/emails in the corporate domain.
         raise SanitizerError(
-            f"Unknown author/committer identity '{key}' not registered in identity_map. "
-            f"Failing closed to prevent metadata leak."
+            f"Unknown author/committer identity '{key}' not registered in identity_map "
+            f"or approved identities. Failing closed to prevent metadata leak."
         )
 
     def sanitize_message(self, raw_message: str) -> str:
@@ -55,7 +73,8 @@ class MetadataSanitizer:
         cleaned = "\n".join(lines).strip() + "\n"
         return cleaned
 
-    def build_commit_env(self, meta: dict) -> Tuple[dict, str]:
+    def build_commit_env(self, meta: dict, direction: str = "A2B") -> Tuple[dict, str]:
+        """Validate both identities for either direction; preserve commit dates."""
         author_name, author_email = self.sanitize_identity(meta["author_name"], meta["author_email"])
         committer_name, committer_email = self.sanitize_identity(meta["committer_name"], meta["committer_email"])
         sanitized_msg = self.sanitize_message(meta["message"])
