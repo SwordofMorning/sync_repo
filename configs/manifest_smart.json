@@ -1,0 +1,57 @@
+{
+  "manifest_version": "2.2",
+  "repo_id": "smart",
+  "legacy_anchor_b_oid": "5f0f16ab0dbe985a12f135f6bbda0b47d8c83bcc",
+  "default_policy": "DENY",
+  "allowed_roots": [
+    "build",
+    "component",
+    "configs",
+    "docs",
+    "include",
+    "platform",
+    "release",
+    "thirdparty",
+    "tools"
+  ],
+  "root_files_allowlist": [
+    "Makefile",
+    "cfg.mk",
+    "release_app_sdk.sh",
+    "编译框架说明.txt",
+    ".gitignore"
+  ],
+  "app_scope": {
+    "allowed_apps": [
+      "mickey_smart"
+    ],
+    "allowed_files": [
+      "Makefile"
+    ]
+  },
+  "legacy_approved_assets_under_anchor": [
+    "release/coti/**",
+    "release/stc/**",
+    "release/victory-512/**",
+    "release/victory-512-v2/**",
+    "release/victory-composite/**",
+    "release/victory-serial/**"
+  ],
+  "explicit_forbidden_prefixes": [
+    "gwp_debug/",
+    "app/DOT/",
+    "app/victory",
+    "app/stc/",
+    "app/night_eye/",
+    "app/coti/",
+    "app/md_ir/",
+    "app/goblin/",
+    "app/lk_mini/",
+    "app/gk7205v300_mini/",
+    "app/snow_wol/",
+    "app/gunsight_kits/",
+    "app/TUBE_Q50L",
+    "app/smart_customize2603/",
+    "app/test/"
+  ]
+}

@@ -1,0 +1,124 @@
+{
+  "schema_version": "2.0",
+  "rule_version": "2.2.0",
+  "description": "Sensitive Asset Exclusion, Build Dependency Protection and Content Scanner Rules",
+  "rules": [
+    {
+      "rule_id": "PRUNE_NON_MICKEY_APPS",
+      "category": "PATH",
+      "pattern": "app/!(mickey_smart|Makefile)/**",
+      "action": "PRUNE",
+      "description": "Prune all non-mickey sub-projects under app/"
+    },
+    {
+      "rule_id": "PRUNE_INTERNAL_DEBUG_DIRS",
+      "category": "PATH",
+      "pattern": "{gwp_debug/**,**/debug/**,**/internal_test/**,**/.playground/**}",
+      "action": "PRUNE",
+      "description": "Prune internal debug, test and scratchpad directories"
+    },
+    {
+      "rule_id": "PRUNE_INTERNAL_DOCS",
+      "category": "FILENAME",
+      "pattern": "*.{docx,xlsx,pptx}",
+      "action": "PRUNE",
+      "description": "Prune internal office documents (including burning docx)"
+    },
+    {
+      "rule_id": "PRUNE_TEMP_BUILD_ARTIFACTS",
+      "category": "FILENAME",
+      "pattern": "*.{tmp,swp,pyc,so.debug}",
+      "action": "PRUNE",
+      "description": "Prune editor swap and temporary files"
+    },
+    {
+      "rule_id": "BLOCK_SUSPECTED_CREDENTIALS",
+      "category": "FILENAME",
+      "pattern": "{*.pem,*.key,id_rsa*,*.token,*.pfx,*.keystore}",
+      "action": "BLOCK_REVIEW",
+      "description": "Halt on suspected private keys or certificates for security review"
+    },
+    {
+      "rule_id": "BLOCK_UNAPPROVED_ARCHIVES",
+      "category": "FILENAME",
+      "pattern": "*.{zip,tar.gz,7z}",
+      "action": "BLOCK_REVIEW",
+      "description": "Halt on unapproved compressed archives unless explicitly whitelisted below"
+    }
+  ],
+  "approved_dependency_exceptions": [
+    {
+      "path": "thirdparty/ffmpeg/FFmpeg-release-7.0.tar.gz",
+      "reason": "Required by thirdparty/ffmpeg/Makefile-dev prebuild",
+      "action": "ALLOW"
+    },
+    {
+      "path": "thirdparty/libuv/libuv-1.x.tar.gz",
+      "reason": "Required by thirdparty/libuv/Makefile-dev prebuild",
+      "action": "ALLOW"
+    },
+    {
+      "path": "tools/package/app.tar.gz",
+      "reason": "Required by tools/package/package.sh firmware packaging",
+      "action": "ALLOW"
+    },
+    {
+      "path": "tools/package/rootfs.tar.gz",
+      "reason": "Required by tools/package/package.sh firmware packaging",
+      "action": "ALLOW"
+    },
+    {
+      "path": "tools/package/resource.tar.gz",
+      "reason": "Required by tools/package/package.sh firmware packaging",
+      "action": "ALLOW"
+    },
+    {
+      "path": "tools/package/bootargs.tar.gz",
+      "reason": "Required by tools/package/package.sh firmware packaging",
+      "action": "ALLOW"
+    },
+    {
+      "path": "tools/package/rootfs/lib/libasan_preinit.o",
+      "reason": "Precompiled runtime object in packaging rootfs, mode 100755",
+      "action": "ALLOW"
+    }
+  ],
+  "content_scanner": {
+    "enabled": true,
+    "scan_scope": [
+      "app/mickey_smart/**",
+      "component/**",
+      "include/**",
+      "configs/**"
+    ],
+    "approved_copyright_exceptions": [
+      "include/libavutil/**",
+      "include/algofusionmodule.h",
+      "app/mickey_smart/modules/bc/inc/algoballisticmodule.h",
+      "component/RtspServer/**",
+      "thirdparty/**"
+    ],
+    "patterns": [
+      {
+        "name": "internal_ip_leak",
+        "pattern": "\\b10\\.42\\.0\\.\\d{1,3}\\b",
+        "severity": "BLOCK"
+      },
+      {
+        "name": "internal_port_leak",
+        "pattern": ":(12123|8088)\\b",
+        "severity": "BLOCK"
+      },
+      {
+        "name": "personal_email_leak",
+        "pattern": "[a-zA-Z0-9._%+-]+@(gmail|qq|163|11|777)\\.com",
+        "severity": "BLOCK"
+      },
+      {
+        "name": "confidential_marker",
+        "pattern": "\\b(CONFIDENTIAL|INTERNAL_ONLY|DO_NOT_DISTRIBUTE)\\b",
+        "severity": "BLOCK"
+      }
+    ]
+  }
+}

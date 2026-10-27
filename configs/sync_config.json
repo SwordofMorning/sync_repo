@@ -1,0 +1,76 @@
+{
+  "global_settings": {
+    "engine_version": "2.2.0",
+    "lock_file": ".sync.lock",
+    "log_file": "sync.log",
+    "max_log_size_mb": 10,
+    "max_log_backups": 5,
+    "default_poll_interval_sec": 900,
+    "identity_map": {
+      "gwp <gwp.workspace@gmail.com>": "龚文平 <wenping.gong@vitalchem.com>",
+      "fzy <fzy@11.com>": "樊振宇 <zhenyu.fan@vitalchem.com>",
+      "fzy <zhenyu.fan@vitalchem.com>": "樊振宇 <zhenyu.fan@vitalchem.com>",
+      "liqijia <nadoutong@777.com>": "李奇珈 <qijia.li@vitalchem.com>",
+      "xjt <969211735@qq.com>": "肖劲涛 <jintao.xiao@vitalchem.com>",
+      "yison <houyi.yang@votinfrared.com>": "杨厚逸 <houyi.yang@votinfrared.com>"
+    },
+    "default_encryption_extensions": [
+      ".c", ".h", ".cpp", ".hpp", ".py", ".json", ".txt", ".sh", ".mk", ".xml"
+    ]
+  },
+  "repositories": [
+    {
+      "repo_id": "smart",
+      "description": "Smart Core Platform & Mickey App",
+      "enabled": true,
+      "source": {
+        "alias": "smart_repo",
+        "url": "git@10.42.0.252:smart/smart.git",
+        "local_path": "../smart",
+        "branch": "main"
+      },
+      "target": {
+        "alias": "smart_ii_repo",
+        "url": "git@10.42.0.252:smart/smart_ii.git",
+        "local_path": "../smart_ii",
+        "branch": "main"
+      },
+      "manifest_path": "configs/manifest_smart.json",
+      "exclude_rules_path": "configs/exclude_rules.json",
+      "state_file": ".sync_state/state_smart.json",
+      "legacy_anchor_b_oid": "5f0f16ab0dbe985a12f135f6bbda0b47d8c83bcc",
+      "history_fold_exceptions": [
+        {
+          "source_commit": "cd6d6fbd6a4c9c4ac3e00e296a5fe251397de4c8",
+          "folded_to_target": "e7c848d306bd24fb3ccc9a7f59505f002c8dedab"
+        }
+      ],
+      "message_sanitization_rules": [
+        {
+          "pattern": "http://10\\.42\\.0\\.252:12123/smart/smart",
+          "replacement": "origin"
+        },
+        {
+          "pattern": "git@10\\.42\\.0\\.252:smart/smart\\.git",
+          "replacement": "origin"
+        },
+        {
+          "pattern": "\\(cherry picked from commit [a-f0-9]{40}\\)",
+          "replacement": ""
+        },
+        {
+          "pattern": "Merge remote-tracking branch 'origin/main' into ([a-zA-Z0-9_-]+)",
+          "replacement": "Merge branch 'main'"
+        },
+        {
+          "pattern": "Merge [a-f0-9]{8,40} \\(origin/([a-zA-Z0-9_-]+)\\)",
+          "replacement": "Merge branch '\\g<1>'"
+        },
+        {
+          "pattern": "(?i)gwp_debug/",
+          "replacement": ""
+        }
+      ]
+    }
+  ]
+}
