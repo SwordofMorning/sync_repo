@@ -81,6 +81,81 @@
       "path": "tools/package/rootfs/lib/libasan_preinit.o",
       "reason": "Precompiled runtime object in packaging rootfs, mode 100755",
       "action": "ALLOW"
+    },
+    {
+      "path": "docs/hi3556烧录/CH341SER.ZIP",
+      "reason": "Approved Hi3556 burning serial driver package",
+      "action": "ALLOW"
+    },
+    {
+      "path": "docs/hi3556烧录/HiTool-BVT-5.4.25-win32-x86_64.zip",
+      "reason": "Approved Hi3556 burning HiTool package",
+      "action": "ALLOW"
+    },
+    {
+      "path": "docs/hi3556烧录/SecureCRT_Portable.zip",
+      "reason": "Approved Hi3556 burning terminal package",
+      "action": "ALLOW"
+    },
+    {
+      "path": "docs/hi3556烧录/分区镜像及SN号烧录说明.docx",
+      "reason": "Approved Hi3556 burning instruction document",
+      "action": "ALLOW"
+    },
+    {
+      "path": "release/stc/1.0.10/手机APP应用升级/1.0.10_app.zip",
+      "reason": "Legacy approved release archive under anchor",
+      "action": "ALLOW"
+    },
+    {
+      "path": "release/stc/1.0.11/手机APP应用升级/1.0.11_app.zip",
+      "reason": "Legacy approved release archive under anchor",
+      "action": "ALLOW"
+    },
+    {
+      "path": "release/stc/1.0.12/手机APP应用升级/1.0.12_app.zip",
+      "reason": "Legacy approved release archive under anchor",
+      "action": "ALLOW"
+    },
+    {
+      "path": "release/victory-composite/1.0.13/1.0.13_app.zip",
+      "reason": "Legacy approved release archive under anchor",
+      "action": "ALLOW"
+    },
+    {
+      "path": "thirdparty/iniparser/iniparser-4.1.tar.gz",
+      "reason": "Required by thirdparty/iniparser build",
+      "action": "ALLOW"
+    },
+    {
+      "path": "thirdparty/iniparser/iniparser-v4.2.4.tar.gz",
+      "reason": "Required by thirdparty/iniparser build",
+      "action": "ALLOW"
+    },
+    {
+      "path": "thirdparty/sqlite3/sqlite-src-3500100.zip",
+      "reason": "Required by thirdparty/sqlite3 build",
+      "action": "ALLOW"
+    },
+    {
+      "path": "thirdparty/ui/awtk/3rd/SDL/VisualC-WinRT/tests/loopwave/loopwave_VS2012_TemporaryKey.pfx",
+      "reason": "Upstream SDL WinRT sample test key in thirdparty/ui/awtk",
+      "action": "ALLOW"
+    },
+    {
+      "path": "thirdparty/ui/awtk/3rd/SDL/VisualC-WinRT/tests/testthread/testthread_VS2012_TemporaryKey.pfx",
+      "reason": "Upstream SDL WinRT sample test key in thirdparty/ui/awtk",
+      "action": "ALLOW"
+    },
+    {
+      "path": "thirdparty/ui/awtk/tests/testdata/assets.zip",
+      "reason": "Upstream AWTK testdata archive in thirdparty/ui/awtk",
+      "action": "ALLOW"
+    },
+    {
+      "path": "thirdparty/ui/awtk/tests/testdata/data.zip",
+      "reason": "Upstream AWTK testdata archive in thirdparty/ui/awtk",
+      "action": "ALLOW"
     }
   ],
   "content_scanner": {

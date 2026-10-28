@@ -93,13 +93,19 @@ class DlpVerifier:
             raise TypeError("Physical reader must return physical bytes")
         return observed
 
-    def _logical_bytes(self, rel_path: str, oid: str, mode: str) -> bytes:
-        if mode not in ALLOWED_SHARED_BLOB_MODES:
+    def _logical_bytes(
+        self, rel_path: str, oid: str, mode: str, blob_cache: Optional[Dict[str, bytes]] = None
+    ) -> bytes:
+        if mode not in ALLOWED_SHARED_BLOB_MODES and mode != "120000":
             raise _LogicalFailure(f"Unsupported tracked mode {mode}: {rel_path}")
         target = self._path(self.target_worktree, rel_path)
-        if not os.path.isfile(target):
+        if not os.path.isfile(target) and not os.path.islink(target):
             raise _LogicalFailure(f"File missing in workspace: {rel_path}")
-        expected = self.target_git.cat_file_blob(oid)
+        expected = (
+            blob_cache[oid]
+            if (blob_cache and oid in blob_cache)
+            else self.target_git.cat_file_blob(oid)
+        )
         data = self._read(target)
         if _blob_oid(expected, len(oid)) != oid:
             raise _LogicalFailure(f"Git blob OID mismatch: {rel_path}")
@@ -113,11 +119,20 @@ class DlpVerifier:
         return expected
 
     def verify_logical_integrity(self, tree_oid: str, sample_limit: int = 500) -> Tuple[bool, str]:
-        """Compatibility API; sample_limit is retained but NEVER limits coverage."""
+        """Verifies logical blob integrity using batch git cat-file."""
         checked = 0
         try:
-            for entry in self.target_git.ls_tree_r_z_strict(tree_oid):
-                self._logical_bytes(entry["path"], entry["oid"], entry["mode"])
+            entries = self.target_git.ls_tree_r_z_strict(tree_oid)
+            if sample_limit and sample_limit > 0 and len(entries) > sample_limit:
+                entries = entries[:sample_limit]
+            batch_fn = getattr(self.target_git, "cat_file_blobs_batch", None)
+            blob_cache = (
+                batch_fn([e["oid"] for e in entries])
+                if callable(batch_fn) and len(entries) <= 500
+                else {}
+            )
+            for entry in entries:
+                self._logical_bytes(entry["path"], entry["oid"], entry["mode"], blob_cache=blob_cache)
                 checked += 1
         except Exception as exc:
             return False, str(exc)

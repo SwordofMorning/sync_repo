@@ -40,6 +40,7 @@
       "exclude_rules_path": "configs/exclude_rules.json",
       "state_file": ".sync_state/state_smart.json",
       "legacy_anchor_b_oid": "5f0f16ab0dbe985a12f135f6bbda0b47d8c83bcc",
+      "allow_forward_merges": true,
       "history_fold_exceptions": [
         {
           "source_commit": "cd6d6fbd6a4c9c4ac3e00e296a5fe251397de4c8",

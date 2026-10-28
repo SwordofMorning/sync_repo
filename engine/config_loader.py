@@ -139,6 +139,7 @@ class SyncConfig:
                 "default_encryption_extensions": self.global_settings.get("default_encryption_extensions", []),
                 "legacy_anchor_a_oid": item.get("legacy_anchor_a_oid", ""),
                 "legacy_anchor_b_oid": item.get("legacy_anchor_b_oid", ""),
+                "allow_forward_merges": bool(item.get("allow_forward_merges", False)),
                 "history_fold_exceptions": item.get("history_fold_exceptions", []),
                 "message_sanitization_rules": item.get("message_sanitization_rules", []),
             }

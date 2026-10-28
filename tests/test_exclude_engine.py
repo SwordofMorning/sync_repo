@@ -50,7 +50,7 @@ class TestExcludeEngine(unittest.TestCase):
         self.assertEqual(dec, ExcludeDecision.PRUNE)
 
     def test_internal_docs_pruned(self):
-        dec, rule_id, _ = self.engine.evaluate_path("docs/hi3556烧录/分区镜像及SN号烧录说明.docx")
+        dec, rule_id, _ = self.engine.evaluate_path("docs/internal_spec.docx")
         self.assertEqual(dec, ExcludeDecision.PRUNE)
 
     def test_approved_dependency_exceptions_exact_match_and_mode(self):

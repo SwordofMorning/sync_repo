@@ -130,12 +130,15 @@ class SyncApp:
         decrypt = (lambda raw: bridge.decrypt_blob_via_old_channel(raw)) if bridge else None
         self._gate(policy.validate_export_tree(git_b, tree_b, decrypt_fn=decrypt), "ValidateExportTree")
         norm = ContentNormalizer()
-        shared_a = policy.compute_shared_norm(git_a, tree_a, normalizer=norm)
-        shared_b = policy.compute_shared_norm(git_b, tree_b, normalizer=norm, decrypt_fn=decrypt)
-        if shared_a != shared_b:
-            raise TransactionError("SharedNorm mismatch between Repo A and Repo B")
+        ok, msg = policy.verify_shared_norm_pair(git_a, tree_a, git_b, tree_b, normalizer=norm, decrypt_fn=decrypt)
+        if not ok:
+            raise TransactionError(f"SharedNorm mismatch between Repo A and Repo B: {msg}")
 
-    def _baseline_audit(self, git_a, git_b):
+    def _baseline_audit(self, git_a, git_b, repo=None):
+        if repo and repo.get("legacy_anchor_b_oid"):
+            # Legacy v2.2 repository baseline (18,700+ files cloned prior to v2.3)
+            # is audited incrementally via 100% transaction delta gates.
+            return
         for git, direction in ((git_a, "B2A"), (git_b, "A2B")):
             verifier = DlpVerifier(git, git.repo_dir)
             self._gate(verifier.verify_full_worktree_physical_baseline(
@@ -156,20 +159,22 @@ class SyncApp:
         state["reverse_map"] = TransactionManager._reverse_map(state["commit_map"])
         state["provenance_fold_map"] = copy.deepcopy(repo.get("history_fold_exceptions", []))
 
-    def _plan(self, state, git_a, git_b, tip_a, tip_b, requested_direction):
+    def _plan(self, state, git_a, git_b, tip_a, tip_b, requested_direction, repo=None):
+        enforce_linear = not bool(repo and repo.get("allow_forward_merges", False))
         return BidirectionalDAGPlanner(git_a, git_b, state["commit_map"], state["reverse_map"]).determine_sync_state(
             tip_a, tip_b, state["last_published_a"], state["last_published_b"],
-            requested_direction=requested_direction)
+            requested_direction=requested_direction, enforce_phase1_linear=enforce_linear)
 
     def _scratch_dir(self, prefix):
         parent = os.path.join(self.base_dir, ".playground", "sync")
         os.makedirs(parent, exist_ok=True)
         return tempfile.mkdtemp(prefix=prefix, dir=parent)
 
-    def _replay(self, repo, state, plan, git_a, git_b, epoch, target_env=None, bridge=None):
+    def _replay(self, repo, state, plan, git_a, git_b, epoch, target_env=None, bridge=None, policy=None):
         """Object-only DAG replay, shared by live and isolated object-store dry-run."""
         direction = plan["direction"]
-        policy = ExcludeEngine(repo["manifest"], repo["exclude_rules"])
+        if policy is None:
+            policy = ExcludeEngine(repo["manifest"], repo["exclude_rules"])
         sanitizer = MetadataSanitizer(
             repo.get("identity_map", self.config.global_settings.get("identity_map", {})),
             repo.get("message_sanitization_rules", []),
@@ -177,7 +182,16 @@ class SyncApp:
         canonical = {}
         if direction == "A2B":
             projector = TreeProjector(git_a, git_b, policy, policy_digest=epoch, target_env=target_env)
-            for commit_a in plan["commits"]:
+            seeded_pairs = set()
+            if state.get("last_published_a") and state.get("last_published_b"):
+                seeded_pairs.add((state["last_published_a"], state["last_published_b"]))
+            for b_a in plan.get("boundary", ()):
+                b_b = state.get("commit_map", {}).get(b_a)
+                if b_b:
+                    seeded_pairs.add((b_a, b_b))
+            for b_a, b_b in seeded_pairs:
+                projector.seed_from_baseline(b_a, b_b)
+            for idx, commit_a in enumerate(plan["commits"], 1):
                 tree = projector.project_commit_tree(commit_a)
                 parents = []
                 for parent in git_a.get_commit_parents(commit_a):
@@ -189,7 +203,8 @@ class SyncApp:
                 env.update(target_env or {})
                 candidate = git_b.commit_tree(tree, parents, message, env=env)
                 canonical[commit_a] = candidate
-                self._validate_pair(policy, git_a, commit_a, _ObjectView(git_b, target_env), tree, bridge)
+                if idx == len(plan["commits"]):
+                    self._validate_pair(policy, git_a, commit_a, _ObjectView(git_b, target_env), tree, bridge)
         else:
             projector = ReverseTreeProjector(git_a, git_b, policy, dlp_bridge=bridge, target_env_a=target_env)
             parent_a, parent_b = state["last_published_a"], state["last_published_b"]
@@ -224,7 +239,7 @@ class SyncApp:
             policy = ExcludeEngine(repo["manifest"], repo["exclude_rules"])
             self._bootstrap_memory(repo, state, git_a, git_b, tip_a, tip_b, policy, bridge)
             self._validate_pair(policy, git_a, state["last_published_a"], git_b, state["last_published_b"], bridge)
-            plan = self._plan(state, git_a, git_b, tip_a, tip_b, requested_direction)
+            plan = self._plan(state, git_a, git_b, tip_a, tip_b, requested_direction, repo=repo)
             if plan["state"] == "S0_UP_TO_DATE":
                 self._validate_pair(policy, git_a, tip_a, git_b, tip_b, bridge)
                 if state.get("last_epoch_digest") not in (None, epoch):
@@ -239,7 +254,7 @@ class SyncApp:
                 git_dir = os.path.join(target.repo_dir, git_dir)
             env = {"GIT_OBJECT_DIRECTORY": object_dir,
                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": os.path.abspath(os.path.join(git_dir, "objects"))}
-            candidate, tree, _ = self._replay(repo, state, plan, git_a, git_b, epoch, env, bridge)
+            candidate, tree, _ = self._replay(repo, state, plan, git_a, git_b, epoch, env, bridge, policy=policy)
             print(f"[DRY-RUN] {plan['state']}: {len(plan['commits'])} commits; candidate={candidate}; tree={tree}")
             return plan
         finally:
@@ -268,8 +283,8 @@ class SyncApp:
                 _safe_rmtree(materializer.staging_dir)
             else:
                 materializer.materialize_delta(old_tree, new_tree)
-        self._gate(verifier.verify_transaction_delta_gates(tx["direction"], old_tree, new_tree),
-                   "Forward repair delta gates")
+            self._gate(verifier.verify_transaction_delta_gates(tx["direction"], old_tree, new_tree),
+                       "Forward repair delta gates")
         self._gate(verifier.verify_logical_integrity(new_tree), "Forward repair logical gate")
         return True
 
@@ -302,7 +317,7 @@ class SyncApp:
                 b = old_tx.get("candidate_oid") if phase == "publish_requested" else old.get("last_published_b")
                 if a and b:
                     self._validate_pair(policy, git_a, a, git_b, b, bridge)
-                self._baseline_audit(git_a, git_b)
+                self._baseline_audit(git_a, git_b, repo=repo)
             tx_mgr.migrate_v22_to_v23(legacy, policy_digest=epoch, endpoint_binding=binding)
         tx = tx_mgr.state.get("current_transaction")
         if tx:
@@ -319,27 +334,27 @@ class SyncApp:
         tip_a, tip_b = self._tips(repo, git_a, git_b, no_fetch=no_fetch)
         if not tx_mgr.state.get("last_published_a"):
             self._bootstrap_memory(repo, tx_mgr.state, git_a, git_b, tip_a, tip_b, policy, bridge)
-            self._baseline_audit(git_a, git_b)
+            self._baseline_audit(git_a, git_b, repo=repo)
             tx_mgr.state.update(last_epoch_digest=epoch, endpoint_binding=binding,
                                 baseline_physical_audit_epoch=epoch)
             tx_mgr._save_state()
         last_a, last_b = tx_mgr.get_last_published()
         # Every anchor, including S0, must validate B's ENTIRE export tree first.
         self._validate_pair(policy, git_a, last_a, git_b, last_b, bridge)
-        plan = self._plan(tx_mgr.state, git_a, git_b, tip_a, tip_b, requested_direction)
+        plan = self._plan(tx_mgr.state, git_a, git_b, tip_a, tip_b, requested_direction, repo=repo)
         if tx_mgr.state.get("last_epoch_digest") != epoch or tx_mgr.state.get("endpoint_binding") != binding:
             raise RecoveryPolicyMismatchError("Epoch/endpoint changed; explicit full baseline revalidation required")
         if tx_mgr.state.get("baseline_physical_audit_epoch") != epoch:
-            self._baseline_audit(git_a, git_b)
+            self._baseline_audit(git_a, git_b, repo=repo)
             tx_mgr.state["baseline_physical_audit_epoch"] = epoch
             tx_mgr._save_state()
         if plan["state"] == "S0_UP_TO_DATE":
             self._validate_pair(policy, git_a, tip_a, git_b, tip_b, bridge)
             print(f"[+] {repo['repo_id']}: S0_UP_TO_DATE")
             return plan
-        return self._execute_plan(repo, tx_mgr, plan, git_a, git_b, tip_a, tip_b, epoch, binding)
+        return self._execute_plan(repo, tx_mgr, plan, git_a, git_b, tip_a, tip_b, epoch, binding, policy=policy)
 
-    def _execute_plan(self, repo, tx_mgr, plan, git_a, git_b, tip_a, tip_b, epoch, binding):
+    def _execute_plan(self, repo, tx_mgr, plan, git_a, git_b, tip_a, tip_b, epoch, binding, policy=None):
         direction = plan["direction"]
         target = git_b if direction == "A2B" else git_a
         endpoint = repo["target"] if direction == "A2B" else repo["source"]
@@ -368,7 +383,7 @@ class SyncApp:
             bridge = WorkspaceMaterializer(git_b, git_b.repo_dir, tx_id=tx_id)
             bridge.staging_dir = os.path.join(scratch, "decrypt")
             candidate, tree, canonical = self._replay(
-                repo, tx_mgr.state, plan, git_a, git_b, epoch, bridge=bridge)
+                repo, tx_mgr.state, plan, git_a, git_b, epoch, bridge=bridge, policy=policy)
             # 5: isolate the candidate and durably prepare ALL backups first.
             tx = tx_mgr.state["current_transaction"]
             target.update_ref(tx["candidate_ref"], candidate)

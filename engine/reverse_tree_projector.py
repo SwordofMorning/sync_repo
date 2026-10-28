@@ -83,13 +83,13 @@ class ReverseTreeProjector:
             validate_platform_rel_path(path)
         except PathValidationError as exc:
             raise ReverseProjectionError(str(exc)) from exc
-        if mode not in ALLOWED_SHARED_BLOB_MODES or entry_type != "blob":
-            raise ReverseProjectionError(f"Unsupported shared entry at '{path}': {mode} {entry_type}")
         decision, rule_id, reason = self.exclude_engine.evaluate_effective_path(
             path, mode=mode, is_tree=False
         )
         if decision != ExcludeDecision.ALLOW:
             raise ReverseProjectionError(f"Non-exportable path '{path}' ({rule_id}): {reason}")
+        if (mode not in ALLOWED_SHARED_BLOB_MODES and mode != "120000") or entry_type != "blob":
+            raise ReverseProjectionError(f"Unsupported shared entry at '{path}': {mode} {entry_type}")
 
     def _decrypt_blob(self, raw_bytes: bytes, path: str, oid: str) -> bytes:
         if self.dlp_bridge is None:

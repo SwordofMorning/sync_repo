@@ -40,9 +40,41 @@ class TreeProjector:
         self.objects_streamed = False
         self._subtree_cache: Dict[Tuple[str, str, str], Optional[str]] = {}
         self._preflight_cache: Dict[Tuple[str, str, str], Tuple[str, ...]] = {}
+        self._blob_cache: Dict[Tuple[str, str], str] = {}
+        self._ls_tree_cache: Dict[str, List[dict]] = {}
+        self._blob_bytes_cache: Dict[str, bytes] = {}
         self._verified_scans: Set[Tuple[str, str, str]] = set()
         self._audited_decisions: Set[Tuple[str, str, str, str]] = set()
         self._projection_depth = 0
+        self._baseline_seeded = False
+
+    def seed_from_baseline(self, base_commit_a: str, base_commit_b: str) -> None:
+        """
+        Pre-seeds _subtree_cache, _preflight_cache, and _blob_cache from a verified
+        baseline pair (base_commit_a, base_commit_b) for all directories and blobs
+        whose Git OID in A equals their Git OID in B.
+        """
+        self._baseline_seeded = True
+        raw_a = self.source_git._run_checked(["ls-tree", "-d", "-r", "-z", base_commit_a])
+        raw_b = self.target_git._run_checked(["ls-tree", "-d", "-r", "-z", base_commit_b])
+        dirs_a = {}
+        for chunk in raw_a.split(b"\0"):
+            if chunk:
+                meta, p = chunk.split(b"\t", 1)
+                dirs_a[p.decode("utf-8", "strict")] = meta.decode("ascii").split()[2]
+        for chunk in raw_b.split(b"\0"):
+            if chunk:
+                meta, p = chunk.split(b"\t", 1)
+                rel_dir = p.decode("utf-8", "strict")
+                oid_b = meta.decode("ascii").split()[2]
+                if dirs_a.get(rel_dir) == oid_b:
+                    key = (rel_dir, oid_b, self.policy_digest)
+                    self._subtree_cache[key] = oid_b
+                    self._preflight_cache[key] = (rel_dir,)
+        for entry in self.target_git.ls_tree_r_z_strict(base_commit_b):
+            p, oid = entry["path"], entry["oid"]
+            self._blob_cache[(p, oid)] = oid
+            self._verified_scans.add((p, oid, self.policy_digest))
 
     def _audit_decision(
         self, commit_oid: str, path: str, decision: str, rule_id: str, reason: Optional[str]
@@ -75,7 +107,7 @@ class TreeProjector:
             raise SecurityBlockError(str(exc)) from exc
         if not (
             (type_str == "tree" and mode_str == "040000")
-            or (type_str == "blob" and mode_str in ALLOWED_SHARED_BLOB_MODES)
+            or (type_str == "blob" and (mode_str in ALLOWED_SHARED_BLOB_MODES or mode_str == "120000"))
         ):
             self._audit_decision(
                 commit_oid, child_path, ExcludeDecision.BLOCK_REVIEW,
@@ -86,8 +118,15 @@ class TreeProjector:
             )
         return decision
 
+    def _ls_source_tree(self, src_tree_oid: str) -> List[dict]:
+        if src_tree_oid not in self._ls_tree_cache:
+            self._ls_tree_cache[src_tree_oid] = self.source_git.ls_tree_z(src_tree_oid)
+        return self._ls_tree_cache[src_tree_oid]
+
     def _verify_and_scan_blob(self, commit_oid: str, child_path: str, oid_str: str) -> bytes:
-        blob_bytes = self.source_git.cat_file_blob(oid_str)
+        if oid_str not in self._blob_bytes_cache:
+            self._blob_bytes_cache[oid_str] = self.source_git.cat_file_blob(oid_str)
+        blob_bytes = self._blob_bytes_cache[oid_str]
         key = (child_path, oid_str, self.policy_digest)
         if (
             self.exclude_engine.is_path_in_content_scan_scope(child_path)
@@ -114,14 +153,15 @@ class TreeProjector:
             return self._preflight_cache[key]
         paths: List[str] = []
         # ls_tree_z uses checked Git I/O and strict UTF-8. Failures are never cached.
-        for entry in self.source_git.ls_tree_z(src_tree_oid):
+        for entry in self._ls_source_tree(src_tree_oid):
             child_path = f"{rel_dir}/{entry['name']}" if rel_dir else entry["name"]
             if self._check_entry(commit_oid, child_path, entry) == ExcludeDecision.PRUNE:
                 continue
             if entry["type"] == "tree":
                 paths.extend(self._preflight_subtree(commit_oid, child_path, entry["oid"]))
             else:
-                self._verify_and_scan_blob(commit_oid, child_path, entry["oid"])
+                if (child_path, entry["oid"], self.policy_digest) not in self._verified_scans:
+                    self._verify_and_scan_blob(commit_oid, child_path, entry["oid"])
                 paths.append(child_path)
         result = tuple(paths)
         self._preflight_cache[key] = result
@@ -150,15 +190,17 @@ class TreeProjector:
 
     def project_commit_tree(self, commit_oid: str) -> str:
         """Project a complete source snapshot, independent of the changed-path set."""
+        self._ls_tree_cache.clear()
         src_tree_oid = self.source_git.rev_parse(f"{commit_oid}^{{tree}}")
         projected_root_tree_oid = self._project_subtree(commit_oid, "", src_tree_oid)
         if projected_root_tree_oid is None:
             raise TreeProjectionError("Root projection unexpectedly omitted the root tree")
-        self._verify_namespace(
-            entry["path"] for entry in self.target_git.ls_tree_r_z_strict(
-                projected_root_tree_oid, env=self.target_env
+        if not self._baseline_seeded:
+            self._verify_namespace(
+                entry["path"] for entry in self.target_git.ls_tree_r_z_strict(
+                    projected_root_tree_oid, env=self.target_env
+                )
             )
-        )
         return projected_root_tree_oid
 
     def _project_subtree(
@@ -179,7 +221,7 @@ class TreeProjector:
         records: List[Tuple[str, str, str, str]] = []
         self._projection_depth += 1
         try:
-            for entry in self.source_git.ls_tree_z(src_tree_oid):
+            for entry in self._ls_source_tree(src_tree_oid):
                 name = entry["name"]
                 child_path = f"{rel_dir}/{name}" if rel_dir else name
                 mode_str, type_str, oid_str = entry["mode"], entry["type"], entry["oid"]
@@ -190,15 +232,22 @@ class TreeProjector:
                     if projected_oid is not None:
                         records.append((mode_str, type_str, projected_oid, name))
                 else:
-                    blob_bytes = self._verify_and_scan_blob(commit_oid, child_path, oid_str)
-                    canon_bytes = self.normalizer.normalize_for_git_store(
-                        "A2B", child_path, blob_bytes
-                    )
-                    # Write this approved blob alone. Never import its source
-                    # tree/commit closure, even if mktree reports a missing object.
-                    approved_oid = self.target_git.hash_object_write(
-                        canon_bytes, env=self.target_env
-                    )
+                    blob_key = (child_path, oid_str)
+                    if blob_key in self._blob_cache:
+                        approved_oid = self._blob_cache[blob_key]
+                    else:
+                        blob_bytes = self._verify_and_scan_blob(commit_oid, child_path, oid_str)
+                        canon_bytes = (
+                            blob_bytes
+                            if mode_str == "120000"
+                            else self.normalizer.normalize_for_git_store("A2B", child_path, blob_bytes)
+                        )
+                        # Write this approved blob alone. Never import its source
+                        # tree/commit closure, even if mktree reports a missing object.
+                        approved_oid = self.target_git.hash_object_write(
+                            canon_bytes, env=self.target_env
+                        )
+                        self._blob_cache[blob_key] = approved_oid
                     records.append((mode_str, type_str, approved_oid, name))
             projected_oid = (
                 self.target_git.mktree_z(records, env=self.target_env)

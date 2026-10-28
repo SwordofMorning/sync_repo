@@ -1,6 +1,6 @@
 import fnmatch
 import re
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from engine.content_normalizer import ContentNormalizer
 from engine.path_validator import (
@@ -49,7 +49,13 @@ class ExcludeEngine:
         self.copyright_exceptions = self.content_scanner_cfg.get(
             "approved_copyright_exceptions", []
         )
+        self.approved_symlink_prefixes = [
+            p.lower() for p in manifest.get("approved_symlink_prefixes", [])
+        ]
         self.audit_records = []
+        self._verified_export_trees: Set[str] = set()
+        self._verified_scan_oids: Set[Tuple[bool, str]] = set()
+        self._effective_cache: Dict[Tuple[str, str, bool], Tuple[str, str, Optional[str]]] = {}
 
     def _expand_braces(self, pattern: str) -> List[str]:
         # Expands patterns like *.{docx,xlsx} or {*.pem,*.key}
@@ -216,6 +222,16 @@ class ExcludeEngine:
     def evaluate_effective_path(
         self, path: str, mode: str = "100644", is_tree: bool = False
     ) -> Tuple[str, str, Optional[str]]:
+        cache_key = (path, mode, is_tree, len(self.rules))
+        if cache_key in self._effective_cache:
+            return self._effective_cache[cache_key]
+        res = self._evaluate_effective_path_uncached(path, mode=mode, is_tree=is_tree)
+        self._effective_cache[cache_key] = res
+        return res
+
+    def _evaluate_effective_path_uncached(
+        self, path: str, mode: str = "100644", is_tree: bool = False
+    ) -> Tuple[str, str, Optional[str]]:
         """
         Unified Contract 1 decision function (Section 2.2):
         - Exact-match approved_dependency_exceptions with mode in ('100644', '100755') -> ALLOW
@@ -294,6 +310,10 @@ class ExcludeEngine:
             )
 
         if effective_mode not in ALLOWED_SHARED_MODES:
+            if effective_mode == "120000" and any(
+                path.lower().startswith(pref) for pref in self.approved_symlink_prefixes
+            ):
+                return leaf_dec, leaf_rule_id, leaf_reason
             return (
                 ExcludeDecision.BLOCK_REVIEW,
                 "UNSUPPORTED_SHARED_GIT_MODE",
@@ -422,6 +442,75 @@ class ExcludeEngine:
 
         return shared_norm
 
+    def verify_shared_norm_pair(
+        self,
+        git_a,
+        tree_a: str,
+        git_b,
+        tree_b: str,
+        normalizer: Optional[ContentNormalizer] = None,
+        decrypt_fn: Optional[Callable[[bytes], bytes]] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Fast SharedNorm equivalence check between tree_a and tree_b:
+        When a shared path has the exact same mode and Git Blob OID in both trees,
+        its canonical content is guaranteed identical without reading gigabytes of blobs.
+        Only blobs whose OIDs differ between tree_a and tree_b are read and compared via CanonHash.
+        """
+        norm = normalizer if normalizer is not None else ContentNormalizer()
+        ls_a = getattr(git_a, "ls_tree_r_z_strict", git_a.ls_tree_r_z)
+        ls_b = getattr(git_b, "ls_tree_r_z_strict", git_b.ls_tree_r_z)
+
+        allow_a: Dict[str, Tuple[str, str]] = {}
+        for entry in ls_a(tree_a):
+            path, mode, oid = entry["path"], entry["mode"], entry["oid"]
+            is_tree = (entry.get("type", "blob") == "tree") or mode.startswith("04")
+            dec, _, _ = self.evaluate_effective_path(path, mode=mode, is_tree=is_tree)
+            if dec == ExcludeDecision.ALLOW and not is_tree:
+                allow_a[path] = (mode, oid)
+
+        allow_b: Dict[str, Tuple[str, str]] = {}
+        for entry in ls_b(tree_b):
+            path, mode, oid = entry["path"], entry["mode"], entry["oid"]
+            is_tree = (entry.get("type", "blob") == "tree") or mode.startswith("04")
+            dec, _, _ = self.evaluate_effective_path(path, mode=mode, is_tree=is_tree)
+            if dec == ExcludeDecision.ALLOW and not is_tree:
+                allow_b[path] = (mode, oid)
+
+        if set(allow_a.keys()) != set(allow_b.keys()):
+            only_a = sorted(set(allow_a.keys()) - set(allow_b.keys()))[:5]
+            only_b = sorted(set(allow_b.keys()) - set(allow_a.keys()))[:5]
+            return False, f"Shared path set mismatch (only_a={only_a}, only_b={only_b})"
+
+        diff_paths = []
+        for path, (mode_a, oid_a) in allow_a.items():
+            mode_b, oid_b = allow_b[path]
+            if mode_a != mode_b:
+                return False, f"Mode mismatch at '{path}': {mode_a} vs {mode_b}"
+            if oid_a != oid_b or decrypt_fn is not None:
+                if oid_a != oid_b:
+                    diff_paths.append((path, oid_a, oid_b))
+
+        if not diff_paths and decrypt_fn is None:
+            return True, "SHARED_NORM_EQUAL"
+
+        if not diff_paths and decrypt_fn is not None:
+            return True, "SHARED_NORM_EQUAL"
+
+        batch_a = getattr(git_a, "cat_file_blobs_batch", None)
+        batch_b = getattr(git_b, "cat_file_blobs_batch", None)
+        blobs_a = batch_a([oid_a for _, oid_a, _ in diff_paths]) if callable(batch_a) else {}
+        blobs_b = batch_b([oid_b for _, _, oid_b in diff_paths]) if callable(batch_b) else {}
+
+        for path, oid_a, oid_b in diff_paths:
+            raw_a = blobs_a[oid_a] if oid_a in blobs_a else git_a.cat_file_blob(oid_a)
+            raw_b = blobs_b[oid_b] if oid_b in blobs_b else git_b.cat_file_blob(oid_b)
+            plain_b = decrypt_fn(raw_b) if decrypt_fn is not None else raw_b
+            if norm.canon_hash(path, raw_a) != norm.canon_hash(path, plain_b):
+                return False, f"CanonHash mismatch at '{path}'"
+
+        return True, "SHARED_NORM_EQUAL"
+
     def validate_export_tree(
         self,
         git_adapter,
@@ -476,15 +565,17 @@ class ExcludeEngine:
                 )
 
             if not is_tree and self.is_path_in_content_scan_scope(path):
-                scan_candidates.append((path, oid))
+                exempt = self.is_copyright_exempt(path)
+                if (exempt, oid) not in self._verified_scan_oids:
+                    scan_candidates.append((path, oid, exempt))
 
         batch_fn = getattr(git_adapter, "cat_file_blobs_batch", None)
         scan_blobs = (
-            batch_fn([oid for _, oid in scan_candidates])
+            batch_fn([oid for _, oid, _ in scan_candidates])
             if callable(batch_fn) and scan_candidates
             else {}
         )
-        for path, oid in scan_candidates:
+        for path, oid, exempt in scan_candidates:
             raw_bytes = (
                 scan_blobs[oid]
                 if oid in scan_blobs
@@ -500,6 +591,7 @@ class ExcludeEngine:
                     f"Export tree {tree_oid} failed content scan at '{path}' "
                     f"(rule={rule_name}): {hint}",
                 )
+            self._verified_scan_oids.add((exempt, oid))
 
         return True, "EXPORT_TREE_VALID"
 

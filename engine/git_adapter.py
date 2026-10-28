@@ -375,6 +375,28 @@ class GitAdapter:
         )
 
     def read_tree(self, tree_ish: str, env: Optional[dict] = None) -> None:
+        index_path = os.path.join(self.repo_dir, ".git", "index")
+        if env is None and os.path.isfile(index_path) and os.path.getsize(index_path) > 65536:
+            out, _, code = self._run(["diff-index", "--cached", "-R", "-z", tree_ish])
+            if code == 0:
+                chunks = [c for c in out.split(b"\x00") if c]
+                if len(chunks) < 1000:
+                    if chunks:
+                        buf = bytearray()
+                        changed_paths = []
+                        i = 0
+                        while i + 1 < len(chunks):
+                            meta = chunks[i].decode("ascii", errors="strict").split()
+                            path_b = chunks[i + 1]
+                            new_mode, new_oid = meta[1], meta[3]
+                            buf.extend(f"{new_mode} {new_oid}\t".encode("ascii") + path_b + b"\x00")
+                            if new_mode != "000000":
+                                changed_paths.append(path_b.decode("utf-8", errors="strict"))
+                            i += 2
+                        self._run_checked(["update-index", "-z", "--index-info"], stdin_bytes=bytes(buf))
+                        if changed_paths:
+                            self._run(["update-index", "-q", "--refresh", "--"] + changed_paths[:200])
+                    return
         self._run_checked(["read-tree", tree_ish], env=env)
 
     def status_porcelain_z(self) -> List[bytes]:

@@ -37,6 +37,12 @@
     "release/victory-composite/**",
     "release/victory-serial/**"
   ],
+  "approved_symlink_prefixes": [
+    "tools/board/",
+    "tools/pc/",
+    "tools/package/app/extlib/applib/",
+    "tools/package/rootfs/"
+  ],
   "explicit_forbidden_prefixes": [
     "gwp_debug/",
     "app/DOT/",
