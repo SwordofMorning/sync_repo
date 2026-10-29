@@ -61,7 +61,7 @@ class SyncApp:
 
     def run_sync(self, repo_id: Optional[str] = None, dry_run: bool = False,
                  requested_direction: str = "auto", no_fetch: bool = False,
-                 isolated_rehearsal: Optional[str] = None):
+                 isolated_rehearsal: Optional[str] = None, revalidate_baseline: bool = False):
         # A shared kernel lock, not an existence test or a replaceable PID file.
         with ProcessLock(self.lock_file_path):
             if requested_direction not in ("auto", "a2b", "b2a"):
@@ -79,7 +79,8 @@ class SyncApp:
                 elif isolated_rehearsal is not None:
                     self._isolated_rehearsal(repo, isolated_rehearsal, requested_direction, no_fetch)
                 else:
-                    self._sync_single_repo(repo, requested_direction=requested_direction, no_fetch=no_fetch)
+                    self._sync_single_repo(repo, requested_direction=requested_direction,
+                                           no_fetch=no_fetch, revalidate_baseline=revalidate_baseline)
             return 0
 
     @staticmethod
@@ -289,7 +290,8 @@ class SyncApp:
         return True
 
     def _sync_single_repo(self, repo: dict, dry_run: bool = False,
-                          requested_direction: str = "auto", no_fetch: bool = False):
+                          requested_direction: str = "auto", no_fetch: bool = False,
+                          revalidate_baseline: bool = False):
         if dry_run:  # Compatibility callers also get the early isolated path.
             return self._sync_single_repo_dry_run(repo, requested_direction)
         git_a, git_b = GitAdapter(repo["source"]["local_path"]), GitAdapter(repo["target"]["local_path"])
@@ -297,11 +299,13 @@ class SyncApp:
         try:
             bridge = WorkspaceMaterializer(git_b, git_b.repo_dir, tx_id=generate_tx_id(repo["repo_id"], "BRIDGE"))
             bridge.staging_dir = os.path.join(bridge_scratch, "decrypt")
-            return self._sync_live_repo(repo, git_a, git_b, bridge, requested_direction, no_fetch)
+            return self._sync_live_repo(repo, git_a, git_b, bridge, requested_direction, no_fetch,
+                                        revalidate_baseline=revalidate_baseline)
         finally:
             _safe_rmtree(bridge_scratch)
 
-    def _sync_live_repo(self, repo, git_a, git_b, bridge, requested_direction, no_fetch):
+    def _sync_live_repo(self, repo, git_a, git_b, bridge, requested_direction, no_fetch,
+                        revalidate_baseline: bool = False):
         binding = compute_endpoint_binding(git_a, git_b, repo)
         epoch = compute_epoch_digest(repo, binding)
         policy = ExcludeEngine(repo["manifest"], repo["exclude_rules"])
@@ -343,7 +347,17 @@ class SyncApp:
         self._validate_pair(policy, git_a, last_a, git_b, last_b, bridge)
         plan = self._plan(tx_mgr.state, git_a, git_b, tip_a, tip_b, requested_direction, repo=repo)
         if tx_mgr.state.get("last_epoch_digest") != epoch or tx_mgr.state.get("endpoint_binding") != binding:
-            raise RecoveryPolicyMismatchError("Epoch/endpoint changed; explicit full baseline revalidation required")
+            if not revalidate_baseline:
+                raise RecoveryPolicyMismatchError("Epoch/endpoint changed; explicit full baseline revalidation required")
+            self._baseline_audit(git_a, git_b, repo=repo)
+            tx_mgr.state.update(last_epoch_digest=epoch, endpoint_binding=binding,
+                                baseline_physical_audit_epoch=epoch)
+            if tx_mgr.state.get("current_transaction") and tx_mgr.state["current_transaction"].get("phase") == "committed":
+                tx_mgr.state["current_transaction"]["epoch_digest"] = epoch
+                tx_mgr.state["current_transaction"]["policy_digest"] = epoch
+                tx_mgr.state["current_transaction"]["endpoint_binding"] = binding
+            tx_mgr._save_state()
+            print(f"[+] {repo['repo_id']}: Baseline revalidated and rebound to new epoch/endpoint")
         if tx_mgr.state.get("baseline_physical_audit_epoch") != epoch:
             self._baseline_audit(git_a, git_b, repo=repo)
             tx_mgr.state["baseline_physical_audit_epoch"] = epoch
@@ -507,6 +521,8 @@ def main(argv=None):
     sync_p.add_argument("--dry-run", action="store_true", help="Object-isolated, zero-production-write planning")
     sync_p.add_argument("--direction", choices=("auto", "a2b", "b2a"), default="auto")
     sync_p.add_argument("--no-fetch", action="store_true", help="Use existing authoritative remote-tracking refs")
+    sync_p.add_argument("--revalidate-baseline", action="store_true",
+                        help="Revalidate and update baseline epoch/endpoint binding after config or remote URL change")
     sync_p.add_argument("--isolated-rehearsal", metavar="sandbox_dir", default=None)
     map_p = subparsers.add_parser("map", help="Lookup canonical commit correspondence")
     map_p.add_argument("hash")
@@ -522,7 +538,8 @@ def main(argv=None):
         if args.command == "sync":
             return app.run_sync(repo_id=args.repo, dry_run=args.dry_run,
                                 requested_direction=args.direction, no_fetch=args.no_fetch,
-                                isolated_rehearsal=args.isolated_rehearsal)
+                                isolated_rehearsal=args.isolated_rehearsal,
+                                revalidate_baseline=args.revalidate_baseline)
         if args.command == "map":
             app.lookup_map(args.hash, repo_id=args.repo)
         else:

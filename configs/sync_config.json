@@ -32,7 +32,7 @@
       },
       "target": {
         "alias": "smart_ii_repo",
-        "url": "git@10.42.0.252:smart/smart_ii.git",
+        "url": "git@10.42.0.252:remote/smart_ii.git",
         "local_path": "../smart_ii",
         "branch": "main"
       },
